@@ -1,5 +1,6 @@
 .env
 .env.*
+!.env.example
 .venv/
 venv/
 __pycache__/
@@ -23,3 +24,5 @@ build-installer/
 *service-account*.json
 credentials.json
 *.local.json
+*.sqlite
+docs-local/

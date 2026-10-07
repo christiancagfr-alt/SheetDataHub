@@ -1,4 +1,5 @@
 # -*- mode: python ; coding: utf-8 -*-
+import sys
 from pathlib import Path
 
 root = Path(SPECPATH)
@@ -52,3 +53,18 @@ coll = COLLECT(
     upx_exclude=[],
     name='SheetDataHub',
 )
+if sys.platform == 'darwin':
+    icon_png = root / 'assets' / 'logo.png'
+    app = BUNDLE(
+        coll,
+        name='SheetDataHub.app',
+        icon=str(icon_png) if icon_png.exists() else str(root / 'assets' / 'app.ico'),
+        bundle_identifier='app.sheetdatahub.desktop',
+        info_plist={
+            'NSHighResolutionCapable': True,
+            'CFBundleDisplayName': '表数通',
+            'CFBundleName': 'SheetDataHub',
+            'CFBundleShortVersionString': '1.3.0',
+            'LSMinimumSystemVersion': '12.0',
+        },
+    )

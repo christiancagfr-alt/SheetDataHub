@@ -7,9 +7,15 @@ from typing import Any
 import requests
 
 
-APP_VERSION = "1.2.14"
-UPDATE_REPO = "secure-artifacts/SheetDataHub"
+APP_VERSION = "1.3.0"
+UPDATE_REPO = "christiancagfr-alt/SheetDataHub"
 RELEASES_URL = f"https://github.com/{UPDATE_REPO}/releases"
+INSTALLER_URL_PREFIXES = (
+    "https://github.com/",
+    "https://objects.githubusercontent.com/",
+    "https://release-assets.githubusercontent.com/",
+    "https://github-releases.githubusercontent.com/",
+)
 
 
 def parse_version(text: str) -> tuple[int, ...]:
@@ -27,6 +33,13 @@ def is_newer(latest: str, current: str = APP_VERSION) -> bool:
     left, right = parse_version(latest), parse_version(current)
     width = max(len(left), len(right))
     return left + (0,) * (width - len(left)) > right + (0,) * (width - len(right))
+
+
+def installer_url_allowed(url: str) -> bool:
+    text = str(url or "").strip()
+    if not text.startswith("https://"):
+        return False
+    return any(text.startswith(prefix) for prefix in INSTALLER_URL_PREFIXES)
 
 
 def fetch_latest_release(timeout: int = 20) -> dict[str, Any]:
@@ -52,12 +65,15 @@ def fetch_latest_release(timeout: int = 20) -> dict[str, Any]:
         ),
         None,
     )
+    installer_url = str((installer or {}).get("browser_download_url") or "")
+    if installer_url and not installer_url_allowed(installer_url):
+        installer_url = ""
     return {
         "tag": tag or f"v{version}",
         "version": version,
         "url": str(data.get("html_url") or RELEASES_URL),
         "name": str(data.get("name") or tag or version),
-        "installer_url": str((installer or {}).get("browser_download_url") or ""),
+        "installer_url": installer_url,
         "installer_size": int((installer or {}).get("size") or 0),
     }
 
@@ -70,6 +86,8 @@ def download_release_installer(
     url = str(info.get("installer_url") or "").strip()
     if not url:
         raise RuntimeError("该版本没有可用的 Windows 安装包，请稍后再试。")
+    if not installer_url_allowed(url):
+        raise RuntimeError("安装包地址不是 GitHub 官方下载链接，已拒绝。")
     version = re.sub(r"[^0-9A-Za-z._-]", "_", str(info.get("version") or "latest"))
     update_dir = Path(data_dir) / "updates"
     update_dir.mkdir(parents=True, exist_ok=True)
@@ -84,6 +102,9 @@ def download_release_installer(
             headers={"User-Agent": "SheetDataHub"},
         ) as response:
             response.raise_for_status()
+            final_url = str(getattr(response, "url", url) or url)
+            if not installer_url_allowed(final_url):
+                raise RuntimeError("安装包下载被重定向到非 GitHub 地址，已拒绝。")
             written = 0
             with partial.open("wb") as output:
                 for chunk in response.iter_content(chunk_size=1024 * 1024):

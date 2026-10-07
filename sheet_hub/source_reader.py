@@ -8,6 +8,7 @@ import re
 import time
 from pathlib import Path
 from typing import Callable, Iterable
+from urllib.parse import urlparse
 
 import openpyxl
 import requests
@@ -16,6 +17,23 @@ from .models import Record, SourceConfig
 
 
 LogFn = Callable[[str, str], None]
+MAX_XLSX_BYTES = 80 * 1024 * 1024
+XLSX_MAGIC = b"PK"
+GOOGLE_DOWNLOAD_HOSTS = {
+    "docs.google.com",
+    "drive.google.com",
+    "spreadsheets.google.com",
+    "googleusercontent.com",
+}
+
+
+def _google_download_host_ok(url: str) -> bool:
+    host = (urlparse(str(url or "")).hostname or "").casefold()
+    if not host:
+        return False
+    if host in GOOGLE_DOWNLOAD_HOSTS:
+        return True
+    return host.endswith(".google.com") or host.endswith(".googleusercontent.com")
 
 
 def google_retry(call, logger: LogFn | None = None, attempts: int = 7):
@@ -203,9 +221,12 @@ class SourceReader:
     def read(self, source: SourceConfig) -> list[Record]:
         sid = spreadsheet_id(source.url)
         if not sid:
-            path = Path(source.url)
-            if path.exists() and path.suffix.lower() in {".xlsx", ".xlsm"}:
-                return self._read_workbook(source, path.read_bytes(), path.stem)
+            path = Path(source.url).expanduser()
+            if path.is_file() and path.suffix.lower() in {".xlsx", ".xlsm"}:
+                content = path.read_bytes()
+                if len(content) > MAX_XLSX_BYTES:
+                    raise ValueError("本地 Excel 文件过大，已拒绝读取")
+                return self._read_workbook(source, content, path.stem)
             raise ValueError("无法识别 Google 表格链接或本地 Excel 文件")
         credential = source.credential_path.strip()
         if credential:
@@ -223,26 +244,45 @@ class SourceReader:
                 self.logger,
             )
             return [item["properties"]["title"] for item in metadata.get("sheets", [])]
-        response = requests.get(
-            f"https://docs.google.com/spreadsheets/d/{sid}/export?format=xlsx",
-            timeout=60,
-        )
-        response.raise_for_status()
-        workbook = openpyxl.load_workbook(io.BytesIO(response.content), read_only=True, data_only=True)
+        content = self._download_public_xlsx(sid, timeout=60)
+        workbook = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
         names = workbook.sheetnames
         workbook.close()
         return names
 
     def _read_public(self, source: SourceConfig, sid: str) -> list[Record]:
         self.logger("INFO", f"下载公开表格：{source.name}")
+        content = self._download_public_xlsx(sid, timeout=120)
+        return self._read_workbook(source, content, sid)
+
+    @staticmethod
+    def _download_public_xlsx(sid: str, timeout: int = 120) -> bytes:
+        if not re.fullmatch(r"[a-zA-Z0-9_-]{20,}", sid or ""):
+            raise ValueError("表格 ID 无效")
         response = requests.get(
             f"https://docs.google.com/spreadsheets/d/{sid}/export?format=xlsx",
-            timeout=120,
+            timeout=timeout,
+            stream=True,
+            headers={"User-Agent": "SheetDataHub"},
         )
         if response.status_code in {401, 403}:
             raise PermissionError("表格不可公开读取，请共享为可查看或配置服务账号 JSON")
         response.raise_for_status()
-        return self._read_workbook(source, response.content, sid)
+        if not _google_download_host_ok(str(getattr(response, "url", "") or "")):
+            raise ValueError("公开表格下载被重定向到非 Google 地址，已拒绝")
+        chunks: list[bytes] = []
+        total = 0
+        for chunk in response.iter_content(chunk_size=1024 * 256):
+            if not chunk:
+                continue
+            total += len(chunk)
+            if total > MAX_XLSX_BYTES:
+                raise ValueError("公开表格下载超过 80MB，已中止")
+            chunks.append(chunk)
+        content = b"".join(chunks)
+        if not content.startswith(XLSX_MAGIC):
+            raise ValueError("下载内容不是有效的 Excel 文件")
+        return content
 
     def _read_workbook(self, source: SourceConfig, content: bytes, sid: str) -> list[Record]:
         workbook = openpyxl.load_workbook(io.BytesIO(content), read_only=True, data_only=True)
@@ -326,9 +366,9 @@ class SourceReader:
     def _gspread_client(credential: str):
         import gspread
 
-        path = Path(credential)
-        if not path.exists():
-            raise FileNotFoundError(f"服务账号文件不存在：{credential}")
+        path = Path(credential).expanduser()
+        if not path.is_file() or path.suffix.lower() != ".json":
+            raise FileNotFoundError(f"服务账号 JSON 无效或不存在：{credential}")
         return gspread.service_account(filename=str(path))
 
     @staticmethod

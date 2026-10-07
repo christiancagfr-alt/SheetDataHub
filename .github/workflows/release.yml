@@ -1,58 +1,192 @@
+# Build Windows + macOS and attach to the tag Release.
+# Triggers: push tag v*  |  manual workflow_dispatch with tag input
 name: Build and Release
 
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to rebuild (e.g. v1.3.0)"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
 
 jobs:
-  build:
-    runs-on: windows-latest
-    permissions:
-      id-token: write
-      contents: write
-      attestations: write
+  resolve:
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.t.outputs.tag }}
+      version: ${{ steps.t.outputs.version }}
+    steps:
+      - id: t
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            TAG="$INPUT_TAG"
+          else
+            TAG="$REF_NAME"
+          fi
+          if ! [[ "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([.-][A-Za-z0-9]+)?$ ]]; then
+            echo "Tag must look like vX.Y.Z, got: $TAG"
+            exit 1
+          fi
+          VERSION="${TAG#v}"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
 
+  tests:
+    needs: resolve
+    runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
-
+        # actions/checkout@v4.2.2
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
       - name: Setup Python
-        uses: actions/setup-python@v5
+        # actions/setup-python@v5.4.0
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38
         with:
-          python-version: '3.12'
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+      - name: Run tests
+        run: python -m unittest discover -s tests -v
 
-      - name: Install Dependencies
+  build-windows:
+    needs: [resolve, tests]
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Setup Python
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        shell: pwsh
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt pyinstaller
           python -m pip uninstall -y numpy pandas matplotlib scipy; if ($LASTEXITCODE -ne 0) { $global:LASTEXITCODE = 0 }
-          python -c "import openpyxl; print('openpyxl', openpyxl.__version__)"
-
-      - name: Run tests
-        run: python -m unittest discover -s tests -v
-
-      - name: Build Executable (Windows)
+      - name: Build onedir
+        shell: pwsh
         run: |
           python -m PyInstaller --noconfirm --clean --distpath dist-onedir SheetDataHub.spec
-          New-Item -ItemType Directory -Force -Path dist_final | Out-Null
-          Compress-Archive -Path dist-onedir\SheetDataHub -DestinationPath dist_final\SheetDataHub-windows.zip -Force
-
-      - name: Build Installer
+          if (-not (Test-Path "dist-onedir\SheetDataHub\SheetDataHub.exe")) {
+            throw "Windows onedir exe missing"
+          }
+      - name: Package portable zip
+        shell: pwsh
+        run: |
+          $version = "${{ needs.resolve.outputs.version }}"
+          New-Item -ItemType Directory -Force -Path release-assets | Out-Null
+          Compress-Archive -Path dist-onedir\SheetDataHub -DestinationPath "release-assets\SheetDataHub-windows.zip" -Force
+          Get-FileHash -Algorithm SHA256 -LiteralPath "release-assets\SheetDataHub-windows.zip" |
+            ForEach-Object { $_.Hash.ToLowerInvariant() } |
+            Set-Content -Path "release-assets\SheetDataHub-windows.zip.sha256" -Encoding ascii -NoNewline
+      - name: Build installer
+        shell: pwsh
         run: |
           python -m PyInstaller --noconfirm --clean --distpath dist-installer --workpath build-installer SheetDataHubInstaller.spec
           $setup = Get-ChildItem dist-installer -Filter *.exe | Select-Object -First 1
-          if (-not $setup) { throw 'Installer exe not found' }
-          Copy-Item -Path $setup.FullName -Destination dist_final\SheetDataHub-Setup.exe -Force
-          Get-ChildItem dist_final | Format-Table Name, Length
-
-      - name: Attest Build Provenance
-        uses: actions/attest-build-provenance@v2
+          if (-not $setup) { throw "Installer exe not found" }
+          Copy-Item -Path $setup.FullName -Destination "release-assets\SheetDataHub-Setup.exe" -Force
+          Get-FileHash -Algorithm SHA256 -LiteralPath "release-assets\SheetDataHub-Setup.exe" |
+            ForEach-Object { $_.Hash.ToLowerInvariant() } |
+            Set-Content -Path "release-assets\SheetDataHub-Setup.exe.sha256" -Encoding ascii -NoNewline
+          Get-ChildItem release-assets | Format-Table Name, Length
+      - name: Attest Windows artifacts
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be
         with:
-          subject-path: 'dist_final/*'
-
-      - name: Create Release
-        uses: softprops/action-gh-release@v2
+          subject-path: "release-assets/*"
+      - name: Upload Windows artifacts
+        # actions/upload-artifact@v4.6.2
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
-          files: dist_final/*
+          name: windows-assets
+          path: release-assets/*
+          if-no-files-found: error
+
+  build-macos:
+    needs: [resolve, tests]
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Setup Python
+        uses: actions/setup-python@42375524e23c412d93fb67b49958b491fce71c38
+        with:
+          python-version: "3.12"
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller
+      - name: Build macOS app
+        run: |
+          set -euo pipefail
+          python -m PyInstaller --noconfirm --clean --distpath dist-onedir SheetDataHub.spec
+          mkdir -p release-assets dist/release
+          APP=""
+          if [[ -d dist-onedir/SheetDataHub.app ]]; then
+            APP="dist-onedir/SheetDataHub.app"
+          elif [[ -d dist-onedir/SheetDataHub/SheetDataHub.app ]]; then
+            APP="dist-onedir/SheetDataHub/SheetDataHub.app"
+          elif [[ -d dist-onedir/SheetDataHub ]]; then
+            APP="dist-onedir/SheetDataHub"
+          fi
+          if [[ -z "$APP" ]]; then
+            echo "ERROR: macOS build output not found"
+            ls -laR dist-onedir || true
+            exit 1
+          fi
+          ZIP="release-assets/SheetDataHub-macos-arm64.zip"
+          ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
+          shasum -a 256 "$ZIP" | awk '{print $1}' > "${ZIP}.sha256"
+          ls -la release-assets
+      - name: Attest macOS artifacts
+        uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be
+        with:
+          subject-path: "release-assets/*"
+      - name: Upload macOS artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
+        with:
+          name: macos-assets
+          path: release-assets/*
+          if-no-files-found: error
+
+  release:
+    needs: [resolve, tests, build-windows, build-macos]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      - name: Download all artifacts
+        # actions/download-artifact@v4.2.1
+        uses: actions/download-artifact@95815c38cf2ff2164869cbab79da8d1f422bc89e
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: List assets
+        run: ls -la artifacts
+      - name: Create / update GitHub Release
+        # softprops/action-gh-release@v2.2.1
+        uses: softprops/action-gh-release@c95fe1489396fe8a9eb87c0abf8aa5b2ef267fda
+        with:
+          tag_name: ${{ needs.resolve.outputs.tag }}
+          name: 表数通 ${{ needs.resolve.outputs.version }}
+          files: artifacts/*
           generate_release_notes: true
+          make_latest: true
+          fail_on_unmatched_files: true

@@ -1,6 +1,6 @@
 # 表数通
 
-一个可配置的 Windows 桌面数据工具，用于从一个或多个 Google 表格链接中遍历子 Sheet、映射字段、汇总、查询，以及按时间增量提取并去重。
+一个可配置的桌面数据工具（Windows / macOS），用于从一个或多个 Google 表格链接中遍历子 Sheet、映射字段、汇总、查询、数据分析，以及按时间增量提取并去重。
 
 ## 运行
 
@@ -14,6 +14,21 @@ python app.py
 
 查询结果只显示输入电话、专页 ID、姓名、评论贴文、号码、日期和修正格式，并可一键复制“号码 + 修正格式”两列。时间提取写入已有 Google 子工作表时，会按字段别名识别“姓名/名字”“手机号码/号码”等同义表头，并遵循目标工作表现有列顺序。
 
+## 数据分析
+
+侧栏「数据分析」使用你在「数据源」里已经配置好的表格。队别从表头自动匹配；日期列、名字列可在下拉里切换（同一张表有多列时，例如「交教会日期 / 见证日期」「摸底/推广 / 线索名字」）。
+
+- 队别不选 = 全部队别；名字留空 = 该队全员。两者可单独筛选。
+- 默认时间是当月、不对比。可选最近 7 天、最近 2 天或自定义；勾选「对比」后才显示对比期。
+- 曲线上方用小方框勾选要画的数据；太多时点「更多」。勾选「加友途径」会按渠道各画一条线，不是一个总数。
+- 场记（第一场、第二场等）只统计单元格里含 D 的条数，不按时长拆线、也不累计分钟。
+- 鼠标移到曲线节点或饼图扇区上，会悬浮显示准确数字。
+- 每日表在对比开启时同时列出本期和对比期；增减绿色为升、红色为降。
+- 图表可切换曲线或饼图。饼图扇区上显示百分比，并用线连到名称。
+- 排除关键词与数据查询相同，多个词用逗号分隔，命中任一则整行不进入统计。
+- 默认按记录数看总数和日均。
+- 查询和分析都先读本地库。点「同步本地库」会下载表格最新数据并替换本地库；内容完全相同则跳过写入。
+
 ## 子 Sheet 规则
 
 - “指定 Sheet”留空：遍历全部，只跳过排除项。
@@ -22,35 +37,49 @@ python app.py
 
 ## 下载
 
-从 [Releases](https://github.com/secure-artifacts/SheetDataHub/releases) 页面下载最新版本：
+从 [Releases](https://github.com/christiancagfr-alt/SheetDataHub/releases) 页面下载最新版本：
 
 | 文件 | 说明 |
 |------|------|
 | `SheetDataHub-Setup.exe` | Windows 安装程序（推荐） |
-| `SheetDataHub-windows.zip` | 免安装便携包，解压后运行 `SheetDataHub/SheetDataHub.exe` |
+| `SheetDataHub-windows.zip` | Windows 免安装便携包，解压后运行 `SheetDataHub/SheetDataHub.exe` |
+| `SheetDataHub-macos-arm64.zip` | macOS Apple Silicon 包，解压后打开 `SheetDataHub.app` |
 
-系统要求：Windows 10 / 11（64 位）。
+系统要求：Windows 10 / 11（64 位），或 macOS 12+（Apple Silicon）。Mac 若提示无法打开，按住 Control 单击图标再选打开。
 
 ## 验证软件来源
 
 下载后，使用 GitHub CLI 验证文件确实由官方 CI 构建、且未被篡改：
 
 ```bash
-gh attestation verify ./SheetDataHub-windows.zip --repo secure-artifacts/SheetDataHub
-gh attestation verify ./SheetDataHub-Setup.exe --repo secure-artifacts/SheetDataHub
+gh attestation verify ./SheetDataHub-windows.zip --repo christiancagfr-alt/SheetDataHub
+gh attestation verify ./SheetDataHub-Setup.exe --repo christiancagfr-alt/SheetDataHub
+gh attestation verify ./SheetDataHub-macos-arm64.zip --repo christiancagfr-alt/SheetDataHub
 ```
 
 验证成功表示该软件确实由官方 GitHub Actions 构建。
 
 ## 打包（本地）
 
+Windows：
+
 ```powershell
 powershell -ExecutionPolicy Bypass -File build.ps1
 ```
 
+macOS：
+
+```bash
+chmod +x build_macos.sh
+./build_macos.sh
+```
+
 ## 如何发布新版本
 
-本项目使用 GitHub Actions 自动构建和发布。每次发布新版本只需要创建一个 Git Tag 并推送即可。
+发布仓库：https://github.com/christiancagfr-alt/SheetDataHub  
+应用内「检查更新」读取该仓库的 GitHub Releases。
+
+本项目使用 GitHub Actions 自动构建 Windows 与 macOS 包。每次发布新版本只需要创建一个 Git Tag 并推送到个人仓库。
 
 ### 发布步骤
 

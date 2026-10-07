@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import sys
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -25,8 +26,15 @@ CONFIG_EXPORT_FORMAT = "SheetDataHubConfig"
 
 
 def default_data_dir() -> Path:
-    root = Path(os.getenv("LOCALAPPDATA", Path.home() / "AppData" / "Local"))
-    return root / APP_NAME
+    override = os.getenv("SHEET_DATA_HUB_DATA_DIR", "").strip()
+    if override:
+        return Path(override)
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / APP_NAME
+    if os.name == "nt":
+        root = Path(os.getenv("LOCALAPPDATA") or (Path.home() / "AppData" / "Local"))
+        return root / APP_NAME
+    return Path.home() / ".local" / "share" / APP_NAME
 
 
 class ConfigStore:
@@ -35,12 +43,15 @@ class ConfigStore:
         self.data_dir.mkdir(parents=True, exist_ok=True)
         (self.data_dir / "databases").mkdir(exist_ok=True)
         self.db_path = self.data_dir / "app.sqlite"
+        self._settings_cache: dict[str, Any] = {}
         self._initialize()
 
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
         conn = sqlite3.connect(self.db_path)
         conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
         try:
             yield conn
             conn.commit()
@@ -114,6 +125,27 @@ class ConfigStore:
             "sync_google_sheet": "汇总结果",
             "sync_local_xlsx": "",
             "query_refresh_cache": False,
+            "query_exclude_keywords": "",
+            "analysis_source": "direct",
+            "analysis_direct_source_id": "",
+            "analysis_date_field": "",
+            "analysis_name_field": "",
+            "analysis_metric_field": "",
+            "analysis_scope": "team",
+            "analysis_team": "",
+            "analysis_names": "",
+            "analysis_exclude_keywords": "",
+            "analysis_compare_mode": "month",
+            "analysis_compare_enabled": False,
+            "analysis_show_count": True,
+            "analysis_reference_date": "",
+            "analysis_current_start": "",
+            "analysis_current_end": "",
+            "analysis_previous_start": "",
+            "analysis_previous_end": "",
+            "analysis_refresh_cache": False,
+            "analysis_chart_mode": "line",
+            "analysis_stat_headers": [],
         }
         for key, value in defaults.items():
             if self.get(key, None) is None:
@@ -127,14 +159,18 @@ class ConfigStore:
             self.set("field_aliases", aliases)
 
     def get(self, key: str, default: Any = None) -> Any:
+        if key in self._settings_cache:
+            return self._settings_cache[key]
         with self._connect() as conn:
             row = conn.execute("SELECT value FROM settings WHERE key=?", (key,)).fetchone()
         if not row:
             return default
         try:
-            return json.loads(row["value"])
+            value = json.loads(row["value"])
         except json.JSONDecodeError:
-            return row["value"]
+            value = row["value"]
+        self._settings_cache[key] = value
+        return value
 
     def set(self, key: str, value: Any) -> None:
         encoded = json.dumps(value, ensure_ascii=False)
@@ -144,6 +180,7 @@ class ConfigStore:
                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
                 (key, encoded),
             )
+        self._settings_cache[key] = value
 
     def all_settings(self) -> dict[str, Any]:
         with self._connect() as conn:
@@ -182,13 +219,20 @@ class ConfigStore:
             )
 
     def export_config(self) -> dict[str, Any]:
+        settings = self.all_settings()
+        settings["credential_path"] = ""
+        sources = []
+        for source in self.load_sources():
+            item = source.to_dict()
+            item["credential_path"] = ""
+            sources.append(item)
         return {
             "format": CONFIG_EXPORT_FORMAT,
             "version": 1,
             "app_version": APP_VERSION,
             "exported_at": datetime.now().isoformat(timespec="seconds"),
-            "settings": self.all_settings(),
-            "sources": [source.to_dict() for source in self.load_sources()],
+            "settings": settings,
+            "sources": sources,
         }
 
     def import_config(self, payload: dict[str, Any]) -> tuple[int, int]:
@@ -199,9 +243,12 @@ class ConfigStore:
         if not isinstance(settings, dict) or not isinstance(sources, list):
             raise ValueError("配置文件内容不完整。")
         source_items = [SourceConfig.from_dict(item) for item in sources if isinstance(item, dict)]
+        for source in source_items:
+            source.credential_path = ""
+        self._settings_cache.clear()
         with self._connect() as conn:
             for key, value in settings.items():
-                if not isinstance(key, str) or key in {"app_version"}:
+                if not isinstance(key, str) or key in {"app_version", "credential_path"}:
                     continue
                 conn.execute(
                     "INSERT INTO settings(key,value) VALUES(?,?) "

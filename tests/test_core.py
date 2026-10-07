@@ -10,15 +10,52 @@ from unittest.mock import patch
 import openpyxl
 
 from sheet_hub.config_store import ConfigStore
-from sheet_hub.database import AggregateDatabase
-from sheet_hub.engine import DataEngine, parse_date
+from sheet_hub.database import AggregateDatabase, SourceCache
+from sheet_hub.engine import (
+    DATE_HEADER_HINTS,
+    DataEngine,
+    cell_has_d,
+    compare_periods,
+    is_chart_header,
+    is_session_header,
+    is_stat_numeric_header,
+    last_n_days_ranges,
+    list_chart_headers,
+    list_matching_headers,
+    list_name_headers,
+    month_compare_ranges,
+    parse_date,
+    parse_number,
+    pick_header,
+    week_compare_ranges,
+)
 from sheet_hub.models import Record, SourceConfig
-from sheet_hub.source_reader import SourceReader, canonicalize, choose_sheets, google_retry, parse_schema_lines
+from sheet_hub.source_reader import (
+    SourceReader,
+    _google_download_host_ok,
+    canonicalize,
+    choose_sheets,
+    google_retry,
+    parse_schema_lines,
+)
 from sheet_hub.ui import DEFAULT_QUERY_RESULT_FIELDS, is_phone_data_table, query_result_headers
-from sheet_hub.version import APP_VERSION, download_release_installer, fetch_latest_release, is_newer, parse_version
+from sheet_hub.version import (
+    APP_VERSION,
+    download_release_installer,
+    fetch_latest_release,
+    installer_url_allowed,
+    is_newer,
+    parse_version,
+)
 
 
 class RuleTests(unittest.TestCase):
+    def test_google_download_host_allowlist(self):
+        self.assertTrue(_google_download_host_ok("https://docs.google.com/spreadsheets/d/abc/export?format=xlsx"))
+        self.assertTrue(_google_download_host_ok("https://doc-00-00-docs.googleusercontent.com/file"))
+        self.assertFalse(_google_download_host_ok("https://evil.example/file.xlsx"))
+        self.assertFalse(_google_download_host_ok("https://docs.google.com.evil.test/file"))
+
     def test_empty_include_runs_all_except_excluded(self):
         selected, missing = choose_sheets(["订单", "统计", "客户"], [], ["统计"])
         self.assertEqual(selected, ["订单", "客户"])
@@ -63,18 +100,22 @@ class RuleTests(unittest.TestCase):
                     "html_url": "https://example.test/release",
                     "assets": [{
                         "name": "SheetDataHub-Setup.exe",
-                        "browser_download_url": "https://example.test/setup.exe",
+                        "browser_download_url": "https://github.com/christiancagfr-alt/SheetDataHub/releases/download/v9.9.9/SheetDataHub-Setup.exe",
                         "size": 1024 * 1024 + 2,
                     }],
                 }
 
         with patch("sheet_hub.version.requests.get", return_value=FakeJsonResponse()):
             info = fetch_latest_release()
-        self.assertEqual(info["installer_url"], "https://example.test/setup.exe")
+        self.assertTrue(installer_url_allowed(info["installer_url"]))
+        self.assertIn("github.com/", info["installer_url"])
+        self.assertFalse(installer_url_allowed("https://example.test/setup.exe"))
 
         payload = b"MZ" + (b"x" * (1024 * 1024))
 
         class FakeDownloadResponse:
+            url = info["installer_url"]
+
             def __enter__(self):
                 return self
 
@@ -92,6 +133,20 @@ class RuleTests(unittest.TestCase):
         ):
             path = download_release_installer(info, directory)
             self.assertEqual(path.read_bytes()[:2], b"MZ")
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(RuntimeError):
+                download_release_installer(
+                    {"installer_url": "https://example.test/setup.exe", "version": "1.0.0"},
+                    directory,
+                )
+        class FakeRedirectResponse(FakeDownloadResponse):
+            url = "https://example.test/evil.exe"
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "sheet_hub.version.requests.get", return_value=FakeRedirectResponse()
+        ):
+            with self.assertRaises(RuntimeError):
+                download_release_installer(info, directory)
 
     def test_google_429_is_retried(self):
         class QuotaError(Exception):
@@ -203,9 +258,11 @@ class DatabaseTests(unittest.TestCase):
             source_store.set("extract_dedup_fields", "号码,日期")
             source_store.set("column_schema_enabled", True)
             source_store.set("column_schema", [{"name": "手机号码", "column": "H", "enabled": True}])
+            source_store.set("credential_path", r"C:\secrets\service-account.json")
             source_store.save_source(SourceConfig(
                 "s1", "主表", "https://docs.google.com/spreadsheets/d/abc",
                 include_sheets=["订单"], exclude_sheets=["统计"], header_row=1,
+                credential_path=r"C:\secrets\service-account.json",
                 column_schema_enabled=True,
                 column_schema=[{"name": "日期", "column": "I", "enabled": True}],
             ))
@@ -225,6 +282,16 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual(imported_source.include_sheets, ["订单"])
             self.assertFalse(target_store.was_extracted("old"))
             self.assertTrue(target_store.was_extracted("keep"))
+            self.assertEqual(payload["settings"].get("credential_path"), "")
+            self.assertEqual(payload["sources"][0].get("credential_path"), "")
+            target_store.set("credential_path", r"D:\local\sa.json")
+            target_store.import_config({
+                **payload,
+                "settings": {**payload["settings"], "credential_path": r"C:\stolen\sa.json"},
+                "sources": [{**payload["sources"][0], "credential_path": r"C:\stolen\sa.json"}],
+            })
+            self.assertEqual(target_store.get("credential_path"), r"D:\local\sa.json")
+            self.assertEqual(target_store.load_sources()[0].credential_path, "")
 
     def test_sharding_and_query(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -260,6 +327,422 @@ class DatabaseTests(unittest.TestCase):
             results = engine.query_many("号码", ["123", "999"])
             self.assertEqual(results[0][1].sheet_name, "1008-李薇")
             self.assertIsNone(results[1][1])
+
+    def test_query_excludes_multiple_keywords(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            engine = DataEngine(store)
+            engine.database.replace_all([
+                Record("s", "源", "g", "A", 2, {"号码": "123", "备注": "正常客户"}, "h1"),
+                Record("s", "源", "g", "B", 3, {"号码": "123", "备注": "广告推广"}, "h2"),
+                Record("s", "源", "g", "C", 4, {"号码": "123", "备注": "测试账号"}, "h3"),
+            ])
+            results = engine.query_many("号码", ["123"], exclude_keywords=["广告", "测试"])
+            self.assertEqual([record.sheet_name for _, record in results if record], ["A"])
+            none = engine.query_many("号码", ["123"], exclude_keywords=["正常", "广告", "测试"])
+            self.assertIsNone(none[0][1])
+
+    def test_parse_number_strips_commas_and_percent(self):
+        self.assertEqual(parse_number("1,234.50"), 1234.5)
+        self.assertEqual(parse_number("12%"), 12.0)
+        self.assertIsNone(parse_number("广告"))
+        self.assertIsNone(parse_number(""))
+
+    def test_week_and_month_compare_ranges(self):
+        reference = date(2026, 10, 7)
+        (current_start, current_end), (previous_start, previous_end) = week_compare_ranges(reference)
+        self.assertEqual((current_start, current_end), (date(2026, 10, 5), date(2026, 10, 7)))
+        self.assertEqual((previous_start, previous_end), (date(2026, 9, 28), date(2026, 9, 30)))
+        (current_start, current_end), (previous_start, previous_end) = month_compare_ranges(reference)
+        self.assertEqual((current_start, current_end), (date(2026, 10, 1), date(2026, 10, 7)))
+        self.assertEqual((previous_start, previous_end), (date(2026, 9, 1), date(2026, 9, 7)))
+        (_cs, _ce), (previous_start, previous_end) = month_compare_ranges(date(2026, 3, 31))
+        self.assertEqual((previous_start, previous_end), (date(2026, 2, 1), date(2026, 2, 28)))
+        (current_start, current_end), (previous_start, previous_end) = last_n_days_ranges(reference, 7)
+        self.assertEqual((current_start, current_end), (date(2026, 10, 1), date(2026, 10, 7)))
+        self.assertEqual((previous_start, previous_end), (date(2026, 9, 24), date(2026, 9, 30)))
+        (current_start, current_end), (previous_start, previous_end) = last_n_days_ranges(reference, 2)
+        self.assertEqual((current_start, current_end), (date(2026, 10, 6), date(2026, 10, 7)))
+        self.assertEqual((previous_start, previous_end), (date(2026, 10, 4), date(2026, 10, 5)))
+        current, previous = compare_periods("days7", reference)
+        self.assertEqual(current, (date(2026, 10, 1), date(2026, 10, 7)))
+        current, previous = compare_periods("month", reference, compare=False)
+        self.assertEqual(current, (date(2026, 10, 1), date(2026, 10, 7)))
+        self.assertLess(previous[1], current[0])
+
+    def test_custom_compare_periods_require_complete_ranges(self):
+        with self.assertRaises(ValueError):
+            compare_periods("custom", date(2026, 10, 7))
+        current, previous = compare_periods(
+            "custom",
+            date(2026, 10, 7),
+            date(2026, 10, 1),
+            date(2026, 10, 7),
+            date(2026, 9, 1),
+            date(2026, 9, 7),
+        )
+        self.assertEqual(current, (date(2026, 10, 1), date(2026, 10, 7)))
+        self.assertEqual(previous, (date(2026, 9, 1), date(2026, 9, 7)))
+
+    def _analysis_records(self):
+        def rec(row: int, name: str, day: str, score: str, note: str = "") -> Record:
+            return Record("s", "源", "g", name, row, {"名字": name, "日期": day, "业绩": score, "备注": note}, f"h{row}")
+
+        return [
+            rec(2, "张三", "2026-10-05", "10"),
+            rec(3, "张三", "2026-10-06", "20"),
+            rec(4, "李四", "2026-10-05", "5"),
+            rec(5, "李四", "2026-10-06", "5"),
+            rec(6, "张三", "2026-09-28", "8"),
+            rec(7, "广告号", "2026-10-06", "100", "广告推广"),
+        ]
+
+    def test_analyze_team_week_compare_exclude_and_daily_growth(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            engine = DataEngine(store)
+            engine.database.replace_all(self._analysis_records())
+            result = engine.analyze(
+                source="aggregate",
+                date_field="日期",
+                name_field="名字",
+                metric_field="业绩",
+                exclude_keywords=["广告"],
+                compare_mode="week",
+                reference_date=date(2026, 10, 6),
+            )
+        self.assertEqual(result.scope, "全部队别 · 全部人员")
+        self.assertEqual(result.current.count, 4)
+        self.assertEqual(result.current.total, 40)
+        self.assertEqual(result.current.average, 10)
+        self.assertEqual(result.previous.count, 1)
+        self.assertEqual(result.previous.total, 8)
+        self.assertEqual(result.delta_total, 32)
+        people = {item.name: item for item in result.people}
+        self.assertEqual(people["张三"].total, 30)
+        self.assertEqual(people["张三"].count, 2)
+        self.assertEqual(people["张三"].previous_count, 1)
+        self.assertEqual(people["李四"].total, 10)
+        self.assertEqual(people["李四"].previous_count, 0)
+        self.assertNotIn("广告号", people)
+        daily = {point.day: point for point in result.current.daily}
+        self.assertEqual(daily["2026-10-05"].total, 15)
+        self.assertEqual(daily["2026-10-06"].total, 25)
+        self.assertEqual(daily["2026-10-06"].growth, 10)
+        previous_daily = {point.day: point.count for point in result.previous.daily}
+        self.assertEqual(previous_daily["2026-09-28"], 1)
+        self.assertIn("2026-09-29", previous_daily)
+        headers = {item.name: item for item in result.header_stats}
+        self.assertEqual(headers["业绩"].total, 40)
+        self.assertNotIn("日期", headers)
+
+    def test_analyze_person_filter_and_count_metric(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            engine = DataEngine(store)
+            engine.database.replace_all(self._analysis_records())
+            result = engine.analyze(
+                source="aggregate",
+                date_field="日期",
+                name_field="名字",
+                metric_field="",
+                names=["张三"],
+                exclude_keywords=["广告"],
+                compare_mode="week",
+                reference_date=date(2026, 10, 6),
+            )
+        self.assertEqual(result.scope, "全部队别 · 张三")
+        self.assertEqual(result.metric_field, "记录数")
+        self.assertEqual(result.current.count, 2)
+        self.assertEqual(result.current.total, 2)
+        self.assertEqual([item.name for item in result.people], ["张三"])
+
+    def test_analyze_custom_period_and_missing_person(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            engine = DataEngine(store)
+            engine.database.replace_all(self._analysis_records())
+            result = engine.analyze(
+                source="aggregate",
+                date_field="日期",
+                name_field="名字",
+                metric_field="业绩",
+                compare_mode="custom",
+                current_start=date(2026, 10, 5),
+                current_end=date(2026, 10, 6),
+                previous_start=date(2026, 9, 28),
+                previous_end=date(2026, 9, 28),
+            )
+            self.assertEqual(result.current.total, 140)
+            self.assertEqual(result.previous.total, 8)
+            with self.assertRaises(ValueError):
+                engine.analyze(
+                    source="aggregate",
+                    date_field="日期",
+                    name_field="名字",
+                    names=["不存在的人"],
+                    compare_mode="week",
+                    reference_date=date(2026, 10, 6),
+                )
+
+    def test_pick_header_follows_schema_and_skips_lead_name(self):
+        headers = ["队别", "状态", "交教会日期", "组别", "摸底/推广", "见证日期", "线索名字"]
+        self.assertEqual(pick_header(headers, ("日期", "时间")), "交教会日期")
+        self.assertEqual(pick_header(headers, ("队别", "队伍")), "队别")
+        self.assertEqual(pick_header(headers, ("摸底/推广", "姓名", "名字"), ("线索",)), "摸底/推广")
+        self.assertEqual(
+            list_matching_headers(headers, DATE_HEADER_HINTS),
+            ["交教会日期", "见证日期"],
+        )
+        self.assertFalse(is_stat_numeric_header("线索电话号码"))
+        self.assertFalse(is_stat_numeric_header("贴文链接"))
+        self.assertTrue(is_stat_numeric_header("业绩"))
+        self.assertTrue(is_chart_header("加友途径4"))
+        self.assertFalse(is_chart_header("线索电话号码"))
+        self.assertEqual(
+            list_chart_headers(headers + ["线索电话号码", "加友途径4", "贴文链接"]),
+            ["状态", "组别", "加友途径4", "队别", "摸底/推广", "线索名字"],
+        )
+        self.assertEqual(list_name_headers(headers), ["摸底/推广", "线索名字"])
+        self.assertTrue(is_session_header("第一场"))
+        self.assertTrue(is_session_header("第八场"))
+        self.assertFalse(is_session_header("市场"))
+        self.assertTrue(cell_has_d("10.6 D 97min/笔聊73min"))
+        self.assertTrue(cell_has_d("①D 2min"))
+        self.assertFalse(cell_has_d("Não"))
+        self.assertFalse(cell_has_d("10.2 1min"))
+        self.assertFalse(cell_has_d("AND"))
+
+    def test_analyze_team_and_name_are_independent(self):
+        records = [
+            Record("s", "交教会", "g", "浇灌", 2, {"队别": "安桑1队", "交教会日期": "2026-10-05", "摸底/推广": "心路Maria/张小川"}, "a"),
+            Record("s", "交教会", "g", "浇灌", 3, {"队别": "安桑1队", "交教会日期": "2026-10-06", "摸底/推广": "安雨Anna/张小川3"}, "b"),
+            Record("s", "交教会", "g", "浇灌", 4, {"队别": "华人队", "交教会日期": "2026-10-06", "摸底/推广": "心路Maria/张小川"}, "c"),
+            Record("s", "交教会", "g", "浇灌", 5, {"队别": "安桑1队", "交教会日期": "2026-10-06", "摸底/推广": "智岩/阿黎"}, "d"),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            engine = DataEngine(store)
+            engine.database.replace_all(records)
+            whole_team = engine.analyze(
+                source="aggregate",
+                team="安桑1队",
+                compare_mode="week",
+                reference_date=date(2026, 10, 6),
+            )
+            person = engine.analyze(
+                source="aggregate",
+                team="安桑1队",
+                names=["张小川"],
+                compare_mode="week",
+                reference_date=date(2026, 10, 6),
+            )
+            all_teams_person = engine.analyze(
+                source="aggregate",
+                names=["张小川"],
+                compare_mode="week",
+                reference_date=date(2026, 10, 6),
+            )
+        self.assertEqual(whole_team.date_field, "交教会日期")
+        self.assertEqual(whole_team.team_field, "队别")
+        self.assertEqual(whole_team.name_field, "摸底/推广")
+        self.assertEqual(whole_team.current.count, 3)
+        self.assertEqual(whole_team.scope, "队别 安桑1队 · 整个队别")
+        self.assertEqual(person.current.count, 2)
+        self.assertEqual(person.scope, "队别 安桑1队 · 张小川")
+        self.assertEqual(all_teams_person.current.count, 3)
+        self.assertEqual(all_teams_person.scope, "全部队别 · 张小川")
+
+    def test_analyze_uses_selected_date_column(self):
+        records = [
+            Record("s", "交教会", "g", "浇灌", 2, {
+                "队别": "安桑1队",
+                "交教会日期": "2026-10-05",
+                "见证日期": "2026-09-28",
+                "摸底/推广": "张小川",
+                "线索电话号码": "15512345678",
+            }, "a"),
+            Record("s", "交教会", "g", "浇灌", 3, {
+                "队别": "安桑1队",
+                "交教会日期": "2026-10-06",
+                "见证日期": "2026-10-06",
+                "摸底/推广": "李四",
+                "线索电话号码": "15587654321",
+            }, "b"),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            engine = DataEngine(store)
+            engine.database.replace_all(records)
+            by_meet = engine.analyze(
+                source="aggregate",
+                date_field="交教会日期",
+                compare_mode="week",
+                reference_date=date(2026, 10, 6),
+            )
+            by_witness = engine.analyze(
+                source="aggregate",
+                date_field="见证日期",
+                compare_mode="week",
+                reference_date=date(2026, 10, 6),
+            )
+        self.assertEqual(by_meet.date_field, "交教会日期")
+        self.assertEqual(by_meet.current.count, 2)
+        self.assertEqual(by_meet.previous.count, 0)
+        self.assertEqual(by_witness.date_field, "见证日期")
+        self.assertEqual(by_witness.current.count, 1)
+        self.assertEqual(by_witness.previous.count, 1)
+        self.assertEqual([point.day for point in by_meet.previous.daily], ["2026-09-28", "2026-09-29"])
+        phones = {item.name: item for item in by_meet.header_stats}["线索电话号码"]
+        self.assertFalse(phones.numeric)
+        self.assertIsNone(phones.total)
+        self.assertEqual(phones.count, 2)
+        self.assertNotIn("交教会日期", {item.name for item in by_meet.header_stats})
+
+    def test_analyze_splits_channel_header_into_series(self):
+        records = [
+            Record("s", "交教会", "g", "浇灌", 2, {
+                "交教会日期": "2026-10-05", "加友途径4": "Facebook", "摸底/推广": "张三",
+            }, "a"),
+            Record("s", "交教会", "g", "浇灌", 3, {
+                "交教会日期": "2026-10-05", "加友途径4": "WhatsApp", "摸底/推广": "李四",
+            }, "b"),
+            Record("s", "交教会", "g", "浇灌", 4, {
+                "交教会日期": "2026-10-06", "加友途径4": "Facebook", "摸底/推广": "张三",
+            }, "c"),
+            Record("s", "交教会", "g", "浇灌", 5, {
+                "交教会日期": "2026-09-28", "加友途径4": "Facebook", "摸底/推广": "张三",
+            }, "d"),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            engine = DataEngine(store)
+            engine.database.replace_all(records)
+            compared = engine.analyze(
+                source="aggregate",
+                date_field="交教会日期",
+                compare_mode="week",
+                compare=True,
+                reference_date=date(2026, 10, 6),
+            )
+            current_only = engine.analyze(
+                source="aggregate",
+                date_field="交教会日期",
+                compare_mode="month",
+                compare=False,
+                reference_date=date(2026, 10, 6),
+            )
+        channels = {item.header: item for item in compared.breakdowns}["加友途径4"]
+        series = {part.label: part for part in channels.series}
+        self.assertEqual(series["Facebook"].count, 2)
+        self.assertEqual(series["WhatsApp"].count, 1)
+        self.assertEqual(series["Facebook"].previous_count, 1)
+        self.assertEqual(sum(series["Facebook"].daily), 2)
+        self.assertTrue(compared.compare_enabled)
+        self.assertFalse(current_only.compare_enabled)
+        self.assertEqual(current_only.previous.count, 0)
+        self.assertEqual(current_only.current.count, 3)
+        self.assertEqual(current_only.current.start, "2026-10-01")
+
+    def test_analyze_uses_selected_name_column(self):
+        records = [
+            Record("s", "交教会", "g", "浇灌", 2, {
+                "交教会日期": "2026-10-05", "摸底/推广": "张小川", "线索名字": "小明",
+            }, "a"),
+            Record("s", "交教会", "g", "浇灌", 3, {
+                "交教会日期": "2026-10-06", "摸底/推广": "张小川", "线索名字": "小红",
+            }, "b"),
+            Record("s", "交教会", "g", "浇灌", 4, {
+                "交教会日期": "2026-10-06", "摸底/推广": "李四", "线索名字": "小明",
+            }, "c"),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            engine = DataEngine(store)
+            engine.database.replace_all(records)
+            by_lead = engine.analyze(
+                source="aggregate",
+                date_field="交教会日期",
+                name_field="线索名字",
+                names=["小明"],
+                compare_mode="week",
+                compare=False,
+                reference_date=date(2026, 10, 6),
+            )
+            by_staff = engine.analyze(
+                source="aggregate",
+                date_field="交教会日期",
+                name_field="摸底/推广",
+                names=["张小川"],
+                compare_mode="week",
+                compare=False,
+                reference_date=date(2026, 10, 6),
+            )
+        self.assertEqual(by_lead.name_field, "线索名字")
+        self.assertEqual(by_lead.current.count, 2)
+        self.assertEqual(by_staff.name_field, "摸底/推广")
+        self.assertEqual(by_staff.current.count, 2)
+
+    def test_analyze_session_header_counts_d_not_durations(self):
+        records = [
+            Record("s", "交教会", "g", "浇灌", 2, {
+                "交教会日期": "2026-10-05", "第一场": "Não", "摸底/推广": "张三",
+            }, "a"),
+            Record("s", "交教会", "g", "浇灌", 3, {
+                "交教会日期": "2026-10-05", "第一场": "10.6 D 97min/笔聊73min", "摸底/推广": "李四",
+            }, "b"),
+            Record("s", "交教会", "g", "浇灌", 4, {
+                "交教会日期": "2026-10-06", "第一场": "10.2 1min", "摸底/推广": "张三",
+            }, "c"),
+            Record("s", "交教会", "g", "浇灌", 5, {
+                "交教会日期": "2026-10-06", "第一场": "①D 2min", "摸底/推广": "王五",
+            }, "d"),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            engine = DataEngine(store)
+            engine.database.replace_all(records)
+            result = engine.analyze(
+                source="aggregate",
+                date_field="交教会日期",
+                compare_mode="week",
+                compare=False,
+                reference_date=date(2026, 10, 6),
+            )
+        sessions = {item.header: item for item in result.breakdowns}["第一场"]
+        self.assertEqual(len(sessions.series), 1)
+        self.assertEqual(sessions.series[0].label, "第一场")
+        self.assertEqual(sessions.series[0].count, 2)
+        daily = {point.day: sessions.series[0].daily[index] for index, point in enumerate(result.current.daily)}
+        self.assertEqual(daily["2026-10-05"], 1)
+        self.assertEqual(daily["2026-10-06"], 1)
+        self.assertNotIn("Não", {part.label for part in sessions.series})
+
+    def test_source_cache_merge_skips_unchanged_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            cache = SourceCache(Path(directory))
+            first_rows = [Record("s", "源", "g", "表", 2, {"名字": "张三"}, "h1")]
+            first = cache.merge("s", first_rows, ["名字"])
+            self.assertEqual(first["inserted"], 1)
+            self.assertFalse(first["unchanged"])
+            same = cache.merge("s", first_rows, ["名字"])
+            self.assertTrue(same["unchanged"])
+            self.assertEqual(same["skipped"], 1)
+            self.assertEqual(same["updated"], 0)
+            changed = [Record("s", "源", "g", "表", 2, {"名字": "李四"}, "h2")]
+            updated = cache.merge("s", changed, ["名字"])
+            self.assertEqual(updated["updated"], 1)
+            self.assertEqual(updated["inserted"], 0)
+            self.assertFalse(updated["unchanged"])
+            self.assertEqual(cache.load("s")[0].values["名字"], "李四")
+
+    def test_cached_records_require_local_without_sync(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            engine = DataEngine(store)
+            with self.assertRaises(ValueError) as ctx:
+                engine.cached_records(["missing-id"], require_local=True)
+            self.assertIn("同步本地库", str(ctx.exception))
 
     def test_batch_query_exact_uses_index_and_keeps_all_matches(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -549,6 +1032,7 @@ class DatabaseTests(unittest.TestCase):
                 source="extract",
                 extract_target=str(extract_path),
                 extract_sheet="提取结果",
+                refresh_cache=True,
             )
             self.assertEqual(results[0][1].sheet_name, "1008-李薇")
             self.assertEqual(results[0][1].values["号码"], "123")
@@ -666,7 +1150,9 @@ class WorkbookTests(unittest.TestCase):
             self.assertNotIn("评论贴文", short_fields)
             self.assertIn("评论贴文", long_fields)
             self.assertEqual(
-                engine.query("手机号码", "13800138000", source="direct", source_id="short")[0].source_id,
+                engine.query(
+                    "手机号码", "13800138000", source="direct", source_id="short", refresh_cache=True,
+                )[0].source_id,
                 "short",
             )
 

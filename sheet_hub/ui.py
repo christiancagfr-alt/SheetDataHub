@@ -1,14 +1,15 @@
 from __future__ import annotations
 
 import json
+import math
 import subprocess
 import sys
 import uuid
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QDate, QThread, QTimer, Qt, Signal
-from PySide6.QtGui import QColor, QFontDatabase, QIcon, QPixmap
+from PySide6.QtCore import QDate, QPoint, QPointF, QRect, QThread, QTimer, QUrl, Qt, Signal
+from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontDatabase, QFontMetrics, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -30,6 +31,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPushButton,
     QScrollArea,
+    QSizePolicy,
     QSpinBox,
     QSplitter,
     QStackedWidget,
@@ -37,13 +39,14 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
     QTextEdit,
     QToolButton,
+    QToolTip,
     QVBoxLayout,
     QWidget,
 )
 
 from .config_store import ConfigStore
-from .engine import DataEngine
-from .models import Record, SourceConfig
+from .engine import COMPARE_MODES, DataEngine, compare_periods, is_session_header, list_chart_headers
+from .models import AnalysisResult, Record, SourceConfig
 from .source_reader import (
     SourceReader,
     excel_column,
@@ -51,11 +54,22 @@ from .source_reader import (
     schema_field_names,
     split_names,
 )
-from .version import APP_VERSION, download_release_installer, fetch_latest_release, is_newer
+from .version import APP_VERSION, RELEASES_URL, download_release_installer, fetch_latest_release, is_newer
 
 
 APP_TITLE = "表数通"
 QUERY_SOURCES = ["extract", "aggregate", "direct"]
+RANGE_LABELS = ["当月", "最近7天", "最近2天", "自定义"]
+UI_RANGE_ALIASES = {"week": "month", "month": "month", "days7": "days7", "days2": "days2", "custom": "custom"}
+CHIP_VISIBLE = 4
+DELTA_UP = QColor("#15803d")
+DELTA_DOWN = QColor("#dc2626")
+DELTA_FLAT = QColor("#64748b")
+PIE_COLORS = [
+    QColor("#087fbb"), QColor("#f59e0b"), QColor("#10b981"), QColor("#8b5cf6"),
+    QColor("#ef4444"), QColor("#14b8a6"), QColor("#f97316"), QColor("#6366f1"),
+    QColor("#84cc16"),
+]
 COLUMN_LETTERS = [excel_column(index) for index in range(52)]
 DEFAULT_QUERY_RESULT_FIELDS = ["输入电话号码", "专页ID", "姓名", "评论贴文", "号码", "日期", "修正格式"]
 PHONE_HEADERS = {"号码", "手机号", "手机号码", "电话", "联系电话", "phone", "number"}
@@ -359,7 +373,7 @@ class MainWindow(QMainWindow):
         brand_row.addLayout(brand_text, 1)
         self.nav = QListWidget()
         self.nav.setObjectName("navigation")
-        self.nav.addItems(["数据源", "汇总同步", "数据查询", "时间提取", "字段配置", "运行日志", "设置"])
+        self.nav.addItems(["数据源", "汇总同步", "数据查询", "数据分析", "时间提取", "字段配置", "运行日志", "设置"])
         self.nav.setCurrentRow(0)
         sidebar_layout.addLayout(brand_row)
         sidebar_layout.addSpacing(22)
@@ -374,6 +388,7 @@ class MainWindow(QMainWindow):
         self.pages.addWidget(self._sources_page())
         self.pages.addWidget(self._sync_page())
         self.pages.addWidget(self._query_page())
+        self.pages.addWidget(self._analysis_page())
         self.pages.addWidget(self._extract_page())
         self.pages.addWidget(self._fields_page())
         self.pages.addWidget(self._logs_page())
@@ -489,7 +504,7 @@ class MainWindow(QMainWindow):
     def _query_page(self) -> QWidget:
         page, layout = self._page(
             "数据查询",
-            "结果按当前表自己的表头显示。只有号码数据表才复制号码和修正格式；查询默认走本地缓存。",
+            "查询走本地库。点「同步本地库」会下载表格最新数据并替换本地库。只有号码数据表才复制号码和修正格式。",
         )
         bar = QHBoxLayout()
         self.query_field = QComboBox()
@@ -538,10 +553,8 @@ class MainWindow(QMainWindow):
         button = QPushButton("查询")
         button.setObjectName("primary")
         button.clicked.connect(self.run_query)
-        self.query_refresh_cache = QCheckBox("查询前刷新缓存")
-        self.query_refresh_cache.setChecked(bool(self.store.get("query_refresh_cache", False)))
-        self.query_refresh_cache.toggled.connect(self.persist_workspace_settings)
-        self.refresh_cache_button = QPushButton("刷新缓存")
+        self.refresh_cache_button = QPushButton("同步本地库")
+        self.refresh_cache_button.setToolTip("从表格下载最新数据并替换本地库。内容完全相同则跳过写入。")
         self.refresh_cache_button.clicked.connect(self.run_refresh_cache)
         self.copy_query_button = QPushButton("一键复制结果")
         self.copy_query_button.setEnabled(False)
@@ -554,7 +567,6 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.query_field)
         bar.addWidget(self.query_value, 1)
         bar.addWidget(self.query_fuzzy)
-        bar.addWidget(self.query_refresh_cache)
         bar.addWidget(self.refresh_cache_button)
         bar.addWidget(button)
         bar.addWidget(self.copy_query_button)
@@ -566,6 +578,12 @@ class MainWindow(QMainWindow):
         date_bar.addWidget(self.query_start_date)
         date_bar.addWidget(QLabel("至"))
         date_bar.addWidget(self.query_end_date)
+        date_bar.addWidget(QLabel("排除关键词"))
+        self.query_exclude = QLineEdit(str(self.store.get("query_exclude_keywords", "") or ""))
+        self.query_exclude.setPlaceholderText("多个用逗号分隔，命中任一则排除")
+        self.query_exclude.setMinimumWidth(180)
+        self.query_exclude.editingFinished.connect(self.persist_workspace_settings)
+        date_bar.addWidget(self.query_exclude, 1)
         date_bar.addStretch()
         self.query_table = QTableWidget()
         self.query_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -588,6 +606,230 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.query_table, 1)
         self.update_query_date_controls()
         return page
+
+    def _analysis_page(self) -> QWidget:
+        page, layout = self._page(
+            "数据分析",
+            "查询和分析走本地库。同步会下载表格最新数据并替换本地库。场记只数含 D 的条数。",
+        )
+        self._analysis_result = None
+        self._analysis_chart_headers: list[str] = []
+        self._analysis_header_selected: list[str] = list(self.store.get("analysis_stat_headers", []) or [])
+        bar = QHBoxLayout()
+        bar.setSpacing(8)
+        self.analysis_source_pick = QComboBox()
+        self.analysis_source_pick.setMinimumWidth(140)
+        self.analysis_date_field = QComboBox()
+        self.analysis_date_field.setMinimumWidth(130)
+        self.analysis_name_field = QComboBox()
+        self.analysis_name_field.setMinimumWidth(130)
+        self.analysis_team = QComboBox()
+        self.analysis_team.setEditable(True)
+        self.analysis_team.setInsertPolicy(QComboBox.NoInsert)
+        self.analysis_team.setMinimumWidth(120)
+        self.analysis_names = QLineEdit(str(self.store.get("analysis_names", "") or ""))
+        self.analysis_names.setPlaceholderText("留空=整个队别")
+        self.analysis_exclude = QLineEdit(str(self.store.get("analysis_exclude_keywords", "") or ""))
+        self.analysis_exclude.setPlaceholderText("排除关键词，逗号分隔")
+        self.analysis_cache_status = QLabel("本地库：尚未同步")
+        self.analysis_cache_status.setObjectName("muted")
+        self.analysis_sync_button = QPushButton("同步本地库")
+        self.analysis_sync_button.setToolTip("从表格下载最新数据并替换本地库。内容完全相同则跳过写入。")
+        self.analysis_sync_button.clicked.connect(self.run_analysis_sync)
+        self.analysis_button = QPushButton("开始分析")
+        self.analysis_button.setObjectName("primary")
+        self.analysis_button.clicked.connect(self.run_analysis)
+        bar.addWidget(QLabel("数据源"))
+        bar.addWidget(self.analysis_source_pick)
+        bar.addWidget(QLabel("日期"))
+        bar.addWidget(self.analysis_date_field)
+        bar.addWidget(QLabel("名字列"))
+        bar.addWidget(self.analysis_name_field)
+        bar.addWidget(QLabel("队别"))
+        bar.addWidget(self.analysis_team)
+        bar.addWidget(QLabel("名字"))
+        bar.addWidget(self.analysis_names, 1)
+        bar.addWidget(self.analysis_exclude, 1)
+        bar.addWidget(self.analysis_sync_button)
+        bar.addWidget(self.analysis_button)
+
+        compare_bar = QHBoxLayout()
+        compare_bar.setSpacing(8)
+        self.analysis_range = QComboBox()
+        self.analysis_range.addItems(RANGE_LABELS)
+        saved_mode = UI_RANGE_ALIASES.get(str(self.store.get("analysis_compare_mode", "month") or "month"), "month")
+        if saved_mode in COMPARE_MODES:
+            self.analysis_range.setCurrentIndex(COMPARE_MODES.index(saved_mode))
+        self.analysis_compare_enabled = QCheckBox("对比")
+        self.analysis_compare_enabled.setChecked(bool(self.store.get("analysis_compare_enabled", False)))
+        self.analysis_reference_label = QLabel("截止")
+        self.analysis_reference = QDateEdit(QDate.currentDate())
+        self.analysis_reference.setCalendarPopup(True)
+        self.analysis_reference.setDisplayFormat("yyyy-MM-dd")
+        saved_ref = QDate.fromString(str(self.store.get("analysis_reference_date", "") or ""), "yyyy-MM-dd")
+        if saved_ref.isValid():
+            self.analysis_reference.setDate(saved_ref)
+        self.analysis_current_label = QLabel("本期")
+        self.analysis_current_to = QLabel("至")
+        self.analysis_previous_label = QLabel("对比期")
+        self.analysis_previous_to = QLabel("至")
+        self.analysis_current_start = QDateEdit(QDate.currentDate().addDays(-6))
+        self.analysis_current_end = QDateEdit(QDate.currentDate())
+        self.analysis_previous_start = QDateEdit(QDate.currentDate().addDays(-13))
+        self.analysis_previous_end = QDateEdit(QDate.currentDate().addDays(-7))
+        for widget, key in (
+            (self.analysis_current_start, "analysis_current_start"),
+            (self.analysis_current_end, "analysis_current_end"),
+            (self.analysis_previous_start, "analysis_previous_start"),
+            (self.analysis_previous_end, "analysis_previous_end"),
+        ):
+            widget.setCalendarPopup(True)
+            widget.setDisplayFormat("yyyy-MM-dd")
+            saved = QDate.fromString(str(self.store.get(key, "") or ""), "yyyy-MM-dd")
+            if saved.isValid():
+                widget.setDate(saved)
+        self.analysis_chart_line = QPushButton("曲线")
+        self.analysis_chart_pie = QPushButton("饼图")
+        for button in (self.analysis_chart_line, self.analysis_chart_pie):
+            button.setCheckable(True)
+            button.setObjectName("chartToggle")
+            button.setFixedWidth(56)
+        chart_mode = str(self.store.get("analysis_chart_mode", "line") or "line")
+        self.analysis_chart_line.setChecked(chart_mode != "pie")
+        self.analysis_chart_pie.setChecked(chart_mode == "pie")
+        self.analysis_chart_line.clicked.connect(lambda: self.set_analysis_chart_mode("line"))
+        self.analysis_chart_pie.clicked.connect(lambda: self.set_analysis_chart_mode("pie"))
+        compare_bar.addWidget(QLabel("时间"))
+        compare_bar.addWidget(self.analysis_range)
+        compare_bar.addWidget(self.analysis_reference_label)
+        compare_bar.addWidget(self.analysis_reference)
+        compare_bar.addWidget(self.analysis_current_label)
+        compare_bar.addWidget(self.analysis_current_start)
+        compare_bar.addWidget(self.analysis_current_to)
+        compare_bar.addWidget(self.analysis_current_end)
+        compare_bar.addWidget(self.analysis_compare_enabled)
+        compare_bar.addWidget(self.analysis_previous_label)
+        compare_bar.addWidget(self.analysis_previous_start)
+        compare_bar.addWidget(self.analysis_previous_to)
+        compare_bar.addWidget(self.analysis_previous_end)
+        compare_bar.addStretch()
+        compare_bar.addWidget(self.analysis_chart_line)
+        compare_bar.addWidget(self.analysis_chart_pie)
+
+        self.analysis_source_pick.currentIndexChanged.connect(self.on_analysis_table_changed)
+        self.analysis_date_field.currentTextChanged.connect(self.persist_workspace_settings)
+        self.analysis_name_field.currentTextChanged.connect(self.persist_workspace_settings)
+        self.analysis_team.currentTextChanged.connect(self.persist_workspace_settings)
+        self.analysis_range.currentIndexChanged.connect(self.sync_analysis_periods)
+        self.analysis_range.currentIndexChanged.connect(self.persist_workspace_settings)
+        self.analysis_compare_enabled.toggled.connect(self.sync_analysis_periods)
+        self.analysis_compare_enabled.toggled.connect(self.persist_workspace_settings)
+        self.analysis_reference.dateChanged.connect(self.sync_analysis_periods)
+        self.analysis_reference.dateChanged.connect(self.persist_workspace_settings)
+        for widget in (
+            self.analysis_current_start, self.analysis_current_end,
+            self.analysis_previous_start, self.analysis_previous_end,
+        ):
+            widget.dateChanged.connect(self.persist_workspace_settings)
+        self.analysis_names.editingFinished.connect(self.persist_workspace_settings)
+        self.analysis_exclude.editingFinished.connect(self.persist_workspace_settings)
+
+        stats = QHBoxLayout()
+        stats.setSpacing(8)
+        self.analysis_stat_current = self._stat_card("本期")
+        self.analysis_stat_previous = self._stat_card("对比期")
+        stats.addWidget(self.analysis_stat_current)
+        stats.addWidget(self.analysis_stat_previous)
+
+        self.analysis_summary = QLabel("选数据源后开始分析。勾选加友途径等表头，曲线会按渠道分开。")
+        self.analysis_summary.setObjectName("muted")
+        self.analysis_summary.setWordWrap(True)
+
+        chip_bar = QHBoxLayout()
+        chip_bar.setSpacing(6)
+        chip_label = QLabel("曲线数据")
+        chip_label.setObjectName("sectionTitle")
+        self.analysis_count_check = QCheckBox("记录数")
+        self.analysis_count_check.setObjectName("chipCheck")
+        self.analysis_count_check.setChecked(bool(self.store.get("analysis_show_count", True)))
+        self.analysis_count_check.toggled.connect(self.on_analysis_header_checks)
+        self.analysis_chip_host = QWidget()
+        self.analysis_chip_layout = QHBoxLayout(self.analysis_chip_host)
+        self.analysis_chip_layout.setContentsMargins(0, 0, 0, 0)
+        self.analysis_chip_layout.setSpacing(6)
+        self.analysis_more_headers = QPushButton("更多")
+        self.analysis_more_headers.setObjectName("chartToggle")
+        self.analysis_more_headers.setFixedHeight(26)
+        self.analysis_more_headers.clicked.connect(self.open_analysis_header_more)
+        chip_bar.addWidget(chip_label)
+        chip_bar.addWidget(self.analysis_count_check)
+        chip_bar.addWidget(self.analysis_chip_host, 1)
+        chip_bar.addWidget(self.analysis_more_headers)
+        chip_bar.addStretch()
+
+        self.analysis_chart = LineChartWidget()
+        self.analysis_chart.set_mode(chart_mode)
+
+        tables = QSplitter(Qt.Horizontal)
+        self.analysis_daily_table = QTableWidget()
+        self.analysis_people_table = QTableWidget()
+        for table in (self.analysis_daily_table, self.analysis_people_table):
+            table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+            table.setSelectionBehavior(QAbstractItemView.SelectRows)
+            table.verticalHeader().setVisible(False)
+            table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+            table.setAlternatingRowColors(True)
+        self.analysis_daily_wrap = self._labeled_table("每日记录", self.analysis_daily_table)
+        self.analysis_people_wrap = self._labeled_table("人员明细", self.analysis_people_table)
+        tables.addWidget(self.analysis_daily_wrap)
+        tables.addWidget(self.analysis_people_wrap)
+        tables.setStretchFactor(0, 3)
+        tables.setStretchFactor(1, 2)
+        tables.setMinimumHeight(180)
+
+        layout.addLayout(bar)
+        layout.addWidget(self.analysis_cache_status)
+        layout.addLayout(compare_bar)
+        layout.addLayout(stats)
+        layout.addWidget(self.analysis_summary)
+        layout.addLayout(chip_bar)
+        layout.addWidget(self.analysis_chart, 2)
+        layout.addWidget(tables, 3)
+        self.sync_analysis_periods()
+        return page
+
+    def _labeled_table(self, title: str, table: QTableWidget) -> QWidget:
+        wrap = QWidget()
+        box = QVBoxLayout(wrap)
+        box.setContentsMargins(0, 0, 0, 0)
+        box.setSpacing(4)
+        label = QLabel(title)
+        label.setObjectName("sectionTitle")
+        box.addWidget(label)
+        box.addWidget(table, 1)
+        wrap.title_label = label
+        return wrap
+
+    def _stat_card(self, title: str) -> QFrame:
+        card = QFrame()
+        card.setObjectName("statCard")
+        box = QVBoxLayout(card)
+        box.setContentsMargins(12, 8, 12, 8)
+        heading = QLabel(title)
+        heading.setObjectName("muted")
+        value = QLabel("—")
+        value.setObjectName("statValue")
+        value.setWordWrap(True)
+        extra = QLabel("")
+        extra.setObjectName("muted")
+        extra.setWordWrap(True)
+        box.addWidget(heading)
+        box.addWidget(value)
+        box.addWidget(extra)
+        card.title_label = heading
+        card.value_label = value
+        card.extra_label = extra
+        return card
 
     def _extract_page(self) -> QWidget:
         page, layout = self._page("时间提取", "按日期范围提取数据并写入独立 Excel；历史提取记录会自动排重。")
@@ -825,9 +1067,11 @@ class MainWindow(QMainWindow):
                 self.source_table.setItem(row, column, QTableWidgetItem(value))
         self.refresh_query_source_picker()
         self.refresh_extract_source_picker()
+        self.refresh_analysis_source_picker()
         self.refresh_sync_source_list()
         if not getattr(self, "_restoring_settings", False):
             self.refresh_query_fields()
+            self.refresh_analysis_fields()
 
     def add_source(self) -> None:
         dialog = SourceDialog(self.store, parent=self)
@@ -953,8 +1197,29 @@ class MainWindow(QMainWindow):
                 self.store.set("query_fields_by_mode", saved_map)
             if hasattr(self, "query_source_pick"):
                 self.store.set("query_direct_source_id", self.query_source_pick.currentData() or "")
-            if hasattr(self, "query_refresh_cache"):
-                self.store.set("query_refresh_cache", self.query_refresh_cache.isChecked())
+            if hasattr(self, "query_exclude"):
+                self.store.set("query_exclude_keywords", self.query_exclude.text().strip())
+        if hasattr(self, "analysis_source_pick"):
+            self.store.set("analysis_source", "direct")
+            self.store.set("analysis_direct_source_id", self.analysis_source_pick.currentData() or "")
+            team = self.analysis_team.currentText().strip()
+            if team.startswith("全部"):
+                team = ""
+            self.store.set("analysis_team", team)
+            self.store.set("analysis_date_field", self.analysis_date_field.currentText().strip())
+            self.store.set("analysis_name_field", self.analysis_name_field.currentText().strip())
+            self.store.set("analysis_names", self.analysis_names.text().strip())
+            self.store.set("analysis_chart_mode", "pie" if self.analysis_chart_pie.isChecked() else "line")
+            self.store.set("analysis_stat_headers", self.selected_analysis_headers())
+            self.store.set("analysis_show_count", self.analysis_count_check.isChecked() if hasattr(self, "analysis_count_check") else True)
+            self.store.set("analysis_exclude_keywords", self.analysis_exclude.text().strip())
+            self.store.set("analysis_compare_mode", COMPARE_MODES[self.analysis_range.currentIndex()])
+            self.store.set("analysis_compare_enabled", self.analysis_compare_enabled.isChecked())
+            self.store.set("analysis_reference_date", self.analysis_reference.date().toString("yyyy-MM-dd"))
+            self.store.set("analysis_current_start", self.analysis_current_start.date().toString("yyyy-MM-dd"))
+            self.store.set("analysis_current_end", self.analysis_current_end.date().toString("yyyy-MM-dd"))
+            self.store.set("analysis_previous_start", self.analysis_previous_start.date().toString("yyyy-MM-dd"))
+            self.store.set("analysis_previous_end", self.analysis_previous_end.date().toString("yyyy-MM-dd"))
         if hasattr(self, "output_type"):
             self.store.set("extract_destination_type", "google" if self.output_type.currentIndex() == 1 else "local")
             self.store.set("google_output_url", self.google_output_url.text().strip())
@@ -1039,14 +1304,14 @@ class MainWindow(QMainWindow):
             return
         cache_id = "extract-table" if mode == "extract" else self.current_query_source_id()
         if mode == "direct" and not cache_id:
-            self.query_cache_status.setText("缓存：查询时使用各数据源本地缓存；无缓存会自动拉取")
+            self.query_cache_status.setText("本地库：查询时使用各数据源已同步的数据")
             return
         if cache_id and engine.cache.has(cache_id):
             self.query_cache_status.setText(
-                f"缓存：{engine.cache.row_count(cache_id)} 行，更新于 {engine.cache.updated_at(cache_id)}"
+                f"本地库：{engine.cache.row_count(cache_id)} 行，更新于 {engine.cache.updated_at(cache_id)}"
             )
         else:
-            self.query_cache_status.setText("缓存：尚未建立。点「刷新缓存」或查询时会自动拉取。")
+            self.query_cache_status.setText("本地库：尚未同步。请先点「同步本地库」从表格下载。")
 
     def on_query_mode_changed(self) -> None:
         if getattr(self, "_restoring_settings", False):
@@ -1170,6 +1435,614 @@ class MainWindow(QMainWindow):
         self.update_copy_button()
         self.update_query_cache_status()
 
+    def current_analysis_source_id(self) -> str:
+        if not hasattr(self, "analysis_source_pick"):
+            return ""
+        return str(self.analysis_source_pick.currentData() or "")
+
+    def current_analysis_team(self) -> str:
+        if not hasattr(self, "analysis_team"):
+            return ""
+        text = self.analysis_team.currentText().strip()
+        if not text or text.startswith("全部"):
+            return ""
+        return text
+
+    def on_analysis_table_changed(self) -> None:
+        if getattr(self, "_restoring_settings", False):
+            return
+        self.refresh_analysis_fields()
+        self.persist_workspace_settings()
+
+    def refresh_analysis_source_picker(self) -> None:
+        if not hasattr(self, "analysis_source_pick"):
+            return
+        restoring = self._restoring_settings
+        self._restoring_settings = True
+        saved = str(self.store.get("analysis_direct_source_id", "") or "")
+        current = self.analysis_source_pick.currentData()
+        sources = [source for source in self.store.load_sources() if source.enabled]
+        self.analysis_source_pick.clear()
+        self.analysis_source_pick.addItem("请选择数据源", "")
+        for source in sources:
+            self.analysis_source_pick.addItem(source.name, source.id)
+        target = current if current not in (None, "") else saved
+        index = self.analysis_source_pick.findData(target)
+        if index < 0 and len(sources) == 1:
+            index = 1
+        self.analysis_source_pick.setCurrentIndex(index if index >= 0 else 0)
+        self._restoring_settings = restoring
+        self.refresh_analysis_fields()
+
+    def refresh_analysis_fields(self) -> None:
+        if not hasattr(self, "analysis_date_field"):
+            return
+        source_id = self.current_analysis_source_id()
+        engine = DataEngine(self.store)
+        headers = engine.source_headers(source_id) if source_id else []
+        date_headers = engine.list_date_headers(headers)
+        name_headers = engine.list_name_headers(headers)
+        date_field, team_field, name_field = engine.detect_analysis_fields(headers)
+        restoring = self._restoring_settings
+        self._restoring_settings = True
+        saved_date = self.analysis_date_field.currentText().strip() or str(self.store.get("analysis_date_field", "") or "")
+        self.analysis_date_field.clear()
+        self.analysis_date_field.addItems(date_headers)
+        if saved_date in date_headers:
+            self.analysis_date_field.setCurrentText(saved_date)
+        elif date_field:
+            self.analysis_date_field.setCurrentText(date_field)
+        saved_name_field = self.analysis_name_field.currentText().strip() or str(self.store.get("analysis_name_field", "") or "")
+        self.analysis_name_field.clear()
+        self.analysis_name_field.addItems(name_headers)
+        if saved_name_field in name_headers:
+            self.analysis_name_field.setCurrentText(saved_name_field)
+        elif name_field:
+            self.analysis_name_field.setCurrentText(name_field)
+        saved_team = self.current_analysis_team() or str(self.store.get("analysis_team", "") or "")
+        self.analysis_team.clear()
+        self.analysis_team.addItem("全部队别")
+        teams = engine.list_analysis_teams(source_id, team_field) if source_id and team_field else []
+        self.analysis_team.addItems(teams)
+        if saved_team:
+            index = self.analysis_team.findText(saved_team)
+            if index >= 0:
+                self.analysis_team.setCurrentIndex(index)
+            else:
+                self.analysis_team.setEditText(saved_team)
+        else:
+            self.analysis_team.setCurrentIndex(0)
+        self._restoring_settings = restoring
+        self.rebuild_analysis_header_checks(headers)
+        self.update_analysis_cache_status()
+
+    def current_analysis_range_mode(self) -> str:
+        if not hasattr(self, "analysis_range"):
+            return "month"
+        index = self.analysis_range.currentIndex()
+        if 0 <= index < len(COMPARE_MODES):
+            return COMPARE_MODES[index]
+        return "month"
+
+    def analysis_compare_on(self) -> bool:
+        return bool(hasattr(self, "analysis_compare_enabled") and self.analysis_compare_enabled.isChecked())
+
+    def sync_analysis_periods(self) -> None:
+        if not hasattr(self, "analysis_range"):
+            return
+        mode = self.current_analysis_range_mode()
+        custom = mode == "custom"
+        compare = self.analysis_compare_on()
+        self.analysis_reference_label.setVisible(not custom)
+        self.analysis_reference.setVisible(not custom)
+        for widget in (
+            self.analysis_current_label, self.analysis_current_start,
+            self.analysis_current_to, self.analysis_current_end,
+        ):
+            widget.setVisible(custom)
+        for widget in (
+            self.analysis_previous_label, self.analysis_previous_start,
+            self.analysis_previous_to, self.analysis_previous_end,
+        ):
+            widget.setVisible(custom and compare)
+        if hasattr(self, "analysis_stat_previous"):
+            self.analysis_stat_previous.setVisible(compare)
+        if custom:
+            return
+        restoring = self._restoring_settings
+        self._restoring_settings = True
+        (current_start, current_end), (previous_start, previous_end) = compare_periods(
+            mode, self.analysis_reference.date().toPython(), compare=compare,
+        )
+        self.analysis_current_start.setDate(QDate(current_start.year, current_start.month, current_start.day))
+        self.analysis_current_end.setDate(QDate(current_end.year, current_end.month, current_end.day))
+        self.analysis_previous_start.setDate(QDate(previous_start.year, previous_start.month, previous_start.day))
+        self.analysis_previous_end.setDate(QDate(previous_end.year, previous_end.month, previous_end.day))
+        self._restoring_settings = restoring
+
+    def run_analysis(self) -> None:
+        source_id = self.current_analysis_source_id()
+        if not source_id:
+            QMessageBox.warning(self, "请选择", "请选择你在「数据源」里已经配置好的表格。")
+            return
+        names = split_names(self.analysis_names.text())
+        team = self.current_analysis_team()
+        self.persist_workspace_settings()
+        engine = DataEngine(self.store)
+        if not engine.cache.has(source_id):
+            QMessageBox.warning(self, "请先同步", "本地库还没有这份表。请先点「同步本地库」从表格下载，之后分析都走本地数据。")
+            return
+        self.analysis_summary.setText("正在分析本地库…")
+        date_field = self.analysis_date_field.currentText().strip()
+        name_field = self.analysis_name_field.currentText().strip()
+        self.run_task(
+            lambda: engine.analyze(
+                source="direct",
+                source_id=source_id,
+                date_field=date_field,
+                name_field=name_field,
+                team=team,
+                names=names,
+                exclude_keywords=split_names(self.analysis_exclude.text()),
+                compare_mode=self.current_analysis_range_mode(),
+                compare=self.analysis_compare_on(),
+                reference_date=self.analysis_reference.date().toPython(),
+                current_start=self.analysis_current_start.date().toPython(),
+                current_end=self.analysis_current_end.date().toPython(),
+                previous_start=self.analysis_previous_start.date().toPython(),
+                previous_end=self.analysis_previous_end.date().toPython(),
+                refresh_cache=False,
+            ),
+            self.show_analysis_results,
+            "正在分析本地库…",
+            self.analysis_button,
+        )
+
+    def update_analysis_cache_status(self) -> None:
+        if not hasattr(self, "analysis_cache_status"):
+            return
+        source_id = self.current_analysis_source_id()
+        if not source_id:
+            self.analysis_cache_status.setText("本地库：请选择数据源后同步。")
+            return
+        engine = DataEngine(self.store)
+        if engine.cache.has(source_id):
+            self.analysis_cache_status.setText(
+                f"本地库：{engine.cache.row_count(source_id)} 行，更新于 {engine.cache.updated_at(source_id)}。分析走本地；有新数据再点同步。"
+            )
+        else:
+            self.analysis_cache_status.setText("本地库：尚未同步。请先点「同步本地库」从表格下载。")
+
+    def run_analysis_sync(self) -> None:
+        source_id = self.current_analysis_source_id()
+        if not source_id:
+            QMessageBox.warning(self, "请选择", "请先选择数据源。")
+            return
+        self.persist_workspace_settings()
+        engine = DataEngine(self.store)
+        self.run_task(
+            lambda: engine.refresh_cache([source_id]),
+            self.analysis_sync_finished,
+            "正在从表格同步到本地库…",
+            self.analysis_sync_button,
+        )
+
+    def analysis_sync_finished(self, result: dict) -> None:
+        self.update_analysis_cache_status()
+        self.refresh_analysis_fields()
+        self.refresh_logs()
+        if result.get("unchanged"):
+            extra = "内容与本地库一致，无需重写。"
+        else:
+            extra = "已用表格最新数据替换本地库。"
+        QMessageBox.information(self, "本地库已同步", f"共 {result.get('rows', 0)} 行。{extra}")
+
+    def show_analysis_results(self, result: AnalysisResult) -> None:
+        self.refresh_logs()
+        self._analysis_result = result
+        if result.headers:
+            self.rebuild_analysis_header_checks(result.headers)
+        self.refresh_analysis_visuals(result)
+        if result.names_found:
+            restoring = self._restoring_settings
+            self._restoring_settings = True
+            typed = self.analysis_names.text().strip()
+            self.analysis_names.setPlaceholderText("留空=整个队别")
+            if typed:
+                self.analysis_names.setText(typed)
+            self._restoring_settings = restoring
+
+    def refresh_analysis_visuals(self, result: AnalysisResult) -> None:
+        current = result.current
+        previous = result.previous
+        compare = bool(result.compare_enabled)
+        self.analysis_stat_previous.setVisible(compare)
+        if compare:
+            delta_text = format_delta(result.delta_count, result.delta_count_pct)
+            extra = f"{result.scope}　较对比期 {delta_text}"
+            self._set_stat_card(
+                self.analysis_stat_current,
+                f"本期  {current.start} 至 {current.end}",
+                f"{format_number(current.count)} 条　　日均 {format_number(current.average)}",
+                extra,
+                result.delta_count,
+            )
+            range_label = RANGE_LABELS[COMPARE_MODES.index(result.compare_mode)] if result.compare_mode in COMPARE_MODES else result.compare_mode
+            self._set_stat_card(
+                self.analysis_stat_previous,
+                f"对比期  {previous.start} 至 {previous.end}",
+                f"{format_number(previous.count)} 条　　日均 {format_number(previous.average)}",
+                range_label,
+            )
+            name_note = f" · 名字列「{result.name_field}」" if result.name_field else ""
+            self.analysis_summary.setText(
+                f"{result.scope} · 按「{result.date_field}」{name_note} · 本期 {current.count} 条，对比期 {previous.count} 条。"
+            )
+            self.analysis_daily_wrap.title_label.setText("每日增长（本期 vs 对比期）")
+        else:
+            self._set_stat_card(
+                self.analysis_stat_current,
+                f"{current.start} 至 {current.end}",
+                f"{format_number(current.count)} 条　　日均 {format_number(current.average)}",
+                result.scope,
+            )
+            name_note = f" · 名字列「{result.name_field}」" if result.name_field else ""
+            self.analysis_summary.setText(
+                f"{result.scope} · 按「{result.date_field}」{name_note} · {current.count} 条。"
+            )
+            self.analysis_daily_wrap.title_label.setText("每日记录")
+        self.update_analysis_chart(result)
+        self.fill_analysis_daily_table(result)
+        self.fill_analysis_people_table(result)
+
+    def update_analysis_chart(self, result: AnalysisResult) -> None:
+        current = result.current
+        previous = result.previous
+        compare = bool(result.compare_enabled)
+        labels = [point.day[5:] if len(point.day) >= 10 else point.day for point in current.daily]
+        if not labels:
+            labels = ["—"]
+        series: list[tuple[str, list[tuple[str, float]], QColor]] = []
+        show_count = bool(hasattr(self, "analysis_count_check") and self.analysis_count_check.isChecked())
+        selected = self.selected_analysis_headers()
+        if show_count or not selected:
+            series.append(
+                ("记录数", [(labels[index], float(point.count)) for index, point in enumerate(current.daily)], QColor("#087fbb")),
+            )
+            if compare and previous.daily:
+                prev_labels = labels
+                if len(previous.daily) == len(current.daily):
+                    prev_labels = [
+                        f"{cur[5:]}/{prev[5:]}" if len(cur) >= 10 and len(prev) >= 10 else labels[index]
+                        for index, (cur, prev) in enumerate(
+                            zip([p.day for p in current.daily], [p.day for p in previous.daily])
+                        )
+                    ]
+                    series[0] = ("记录数", [(prev_labels[index], float(point.count)) for index, point in enumerate(current.daily)], QColor("#087fbb"))
+                    labels = prev_labels
+                series.append(
+                    (
+                        "对比期",
+                        [
+                            (labels[index] if index < len(labels) else f"第{index + 1}天", float(point.count))
+                            for index, point in enumerate(previous.daily)
+                        ],
+                        QColor("#94a3b8"),
+                    )
+                )
+        color_index = 0
+        breakdowns = {item.header: item for item in result.breakdowns}
+        session_selected = [header for header in selected if is_session_header(header)]
+        for header in selected:
+            item = breakdowns.get(header)
+            if item is None:
+                continue
+            for part in item.series:
+                daily = list(part.daily) + [0] * max(0, len(labels) - len(part.daily))
+                if part.label == header or is_session_header(header):
+                    series_label = header
+                elif len(selected) > 1:
+                    series_label = f"{header} · {part.label}"
+                else:
+                    series_label = part.label
+                series.append(
+                    (
+                        series_label,
+                        [(labels[index], float(daily[index])) for index in range(len(labels))],
+                        PIE_COLORS[color_index % len(PIE_COLORS)],
+                    )
+                )
+                color_index += 1
+        title = "每日记录数"
+        if selected:
+            title = "每日 · " + "、".join(selected)
+            if session_selected:
+                title += "（场记=含D条数）"
+        self.analysis_chart.set_series(series, title)
+        if session_selected:
+            slices = []
+            for index, header in enumerate(session_selected):
+                item = breakdowns.get(header)
+                if item is None or not item.series:
+                    continue
+                count = float(item.series[0].count)
+                if count > 0:
+                    slices.append((header, count, PIE_COLORS[index % len(PIE_COLORS)]))
+            pie_title = "本期各场含D数量"
+        else:
+            pie_header = selected[0] if selected else ""
+            pie_item = breakdowns.get(pie_header) if pie_header else None
+            if pie_item and pie_item.series:
+                slices = [
+                    (part.label, float(part.count), PIE_COLORS[index % len(PIE_COLORS)])
+                    for index, part in enumerate(pie_item.series)
+                    if part.count > 0
+                ]
+                pie_title = f"本期「{pie_item.header}」占比"
+            else:
+                pie_source = [item for item in result.people if item.count > 0][:8]
+                rest = sum(item.count for item in result.people[8:] if item.count > 0)
+                slices = [
+                    (item.name, float(item.count), PIE_COLORS[index % len(PIE_COLORS)])
+                    for index, item in enumerate(pie_source)
+                ]
+                if rest:
+                    slices.append(("其他", float(rest), QColor("#cbd5e1")))
+                pie_title = "本期人员占比"
+        self.analysis_chart.set_slices(slices, pie_title)
+        self.analysis_chart.set_mode("pie" if self.analysis_chart_pie.isChecked() else "line")
+
+    def set_analysis_chart_mode(self, mode: str) -> None:
+        pie = mode == "pie"
+        self.analysis_chart_line.setChecked(not pie)
+        self.analysis_chart_pie.setChecked(pie)
+        self.analysis_chart.set_mode("pie" if pie else "line")
+        self.persist_workspace_settings()
+
+    def selected_analysis_headers(self) -> list[str]:
+        return [name for name in getattr(self, "_analysis_header_selected", []) if name]
+
+    def rebuild_analysis_header_checks(self, headers: list[str]) -> None:
+        if not hasattr(self, "analysis_chip_layout"):
+            return
+        chartable = list_chart_headers(headers)
+        self._analysis_chart_headers = chartable
+        saved = [name for name in self.selected_analysis_headers() if name in chartable]
+        if not saved:
+            saved = [name for name in list(self.store.get("analysis_stat_headers", []) or []) if name in chartable]
+        self._analysis_header_selected = saved
+        visible: list[str] = []
+        for name in [*saved, *chartable]:
+            if name not in visible:
+                visible.append(name)
+            if len(visible) >= CHIP_VISIBLE:
+                break
+        while self.analysis_chip_layout.count():
+            item = self.analysis_chip_layout.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+        restoring = self._restoring_settings
+        self._restoring_settings = True
+        for name in visible:
+            box = QCheckBox(name)
+            box.setObjectName("chipCheck")
+            box.setChecked(name in saved)
+            box.toggled.connect(lambda checked, header=name: self.toggle_analysis_header(header, checked))
+            self.analysis_chip_layout.addWidget(box)
+        self.analysis_more_headers.setVisible(len(chartable) > CHIP_VISIBLE)
+        extra = len(saved) - sum(1 for name in visible if name in saved)
+        if extra > 0:
+            self.analysis_more_headers.setText(f"更多 +{extra}")
+        else:
+            self.analysis_more_headers.setText("更多")
+        self._restoring_settings = restoring
+
+    def toggle_analysis_header(self, header: str, checked: bool) -> None:
+        if getattr(self, "_restoring_settings", False):
+            return
+        selected = self.selected_analysis_headers()
+        if checked and header not in selected:
+            selected.append(header)
+        if not checked:
+            selected = [name for name in selected if name != header]
+        self._analysis_header_selected = selected
+        self.on_analysis_header_checks()
+
+    def on_analysis_header_checks(self) -> None:
+        if getattr(self, "_restoring_settings", False):
+            return
+        self.persist_workspace_settings()
+        if self._analysis_result is not None:
+            self.update_analysis_chart(self._analysis_result)
+
+    def open_analysis_header_more(self) -> None:
+        headers = list(self._analysis_chart_headers)
+        if not headers:
+            QMessageBox.information(self, "没有可选项", "当前数据源没有可以拆到曲线上的表头。")
+            return
+        selected = set(self.selected_analysis_headers())
+        dialog = QDialog(self)
+        dialog.setWindowTitle("选择曲线显示的数据")
+        dialog.resize(360, 420)
+        box = QVBoxLayout(dialog)
+        hint = QLabel("勾选后按该列的不同取值各画一条线。加友途径按渠道分开；场记（第一场、第二场等）只数含 D 的条数，不是时长。")
+        hint.setObjectName("muted")
+        hint.setWordWrap(True)
+        box.addWidget(hint)
+        listing = QListWidget()
+        for name in headers:
+            item = QListWidgetItem(name)
+            item.setFlags(item.flags() | Qt.ItemIsUserCheckable)
+            item.setCheckState(Qt.Checked if name in selected else Qt.Unchecked)
+            listing.addItem(item)
+        box.addWidget(listing, 1)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(dialog.accept)
+        buttons.rejected.connect(dialog.reject)
+        box.addWidget(buttons)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        picked: list[str] = []
+        for row in range(listing.count()):
+            item = listing.item(row)
+            if item and item.checkState() == Qt.Checked:
+                picked.append(item.text())
+        self._analysis_header_selected = picked
+        self.rebuild_analysis_header_checks(self._analysis_chart_headers)
+        self.on_analysis_header_checks()
+
+    def fill_analysis_daily_table(self, result: AnalysisResult) -> None:
+        current = result.current.daily
+        previous = result.previous.daily
+        if result.compare_enabled:
+            width = max(len(current), len(previous))
+            rows: list[list[object]] = []
+            for index in range(width):
+                cur = current[index] if index < len(current) else None
+                prev = previous[index] if index < len(previous) else None
+                cur_count = cur.count if cur else 0
+                prev_count = prev.count if prev else 0
+                rows.append([
+                    str(index + 1),
+                    cur.day if cur else "",
+                    cur_count,
+                    prev.day if prev else "",
+                    prev_count,
+                    cur_count - prev_count,
+                ])
+            self._fill_delta_table(
+                self.analysis_daily_table,
+                ["天", "本期日期", "本期", "对比日期", "对比", "增减"],
+                rows,
+                delta_column=5,
+                number_columns={2, 4},
+                current_column=2,
+                previous_column=4,
+            )
+            return
+        rows = []
+        for index, point in enumerate(current):
+            prev_count = current[index - 1].count if index else None
+            delta = (point.count - prev_count) if prev_count is not None else 0
+            rows.append([
+                point.day,
+                point.count,
+                delta if index else 0,
+            ])
+        self._fill_delta_table(
+            self.analysis_daily_table,
+            ["日期", "记录数", "较前日"],
+            rows,
+            delta_column=2,
+            number_columns={1},
+            current_column=1,
+            previous_column=None,
+        )
+        if rows:
+            first = self.analysis_daily_table.item(0, 2)
+            if first is not None:
+                first.setText("—")
+                first.setForeground(DELTA_FLAT)
+                first.setBackground(QColor("#ffffff"))
+
+    def fill_analysis_people_table(self, result: AnalysisResult) -> None:
+        if result.compare_enabled:
+            rows = [
+                [item.name, item.count, item.previous_count, item.count - item.previous_count]
+                for item in result.people
+            ]
+            self._fill_delta_table(
+                self.analysis_people_table,
+                ["人员", "本期", "对比", "增减"],
+                rows,
+                delta_column=3,
+                number_columns={1, 2},
+                current_column=1,
+                previous_column=2,
+            )
+            return
+        rows = [[item.name, item.count] for item in result.people]
+        self._fill_delta_table(
+            self.analysis_people_table,
+            ["人员", "记录数"],
+            rows,
+            delta_column=-1,
+            number_columns={1},
+        )
+
+    def _fill_delta_table(
+        self,
+        table: QTableWidget,
+        headers: list[str],
+        rows: list[list[object]],
+        delta_column: int,
+        number_columns: set[int],
+        current_column: int | None = None,
+        previous_column: int | None = None,
+    ) -> None:
+        table.clear()
+        table.setColumnCount(len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            for column, value in enumerate(row):
+                if column == delta_column:
+                    number = float(value or 0)
+                    percent = None
+                    if current_column is not None and previous_column is not None:
+                        percent = delta_percent(
+                            float(row[current_column] or 0),
+                            float(row[previous_column] or 0),
+                        )
+                    item = QTableWidgetItem(format_delta(number, percent))
+                    item.setForeground(self._delta_color(number))
+                    item.setBackground(self._delta_background(number))
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                elif column in number_columns:
+                    item = QTableWidgetItem(format_number(float(value or 0)))
+                    item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
+                else:
+                    item = QTableWidgetItem(str(value))
+                table.setItem(row_index, column, item)
+
+    @staticmethod
+    def _delta_color(value: float | None) -> QColor:
+        number = float(value or 0)
+        if number > 0:
+            return DELTA_UP
+        if number < 0:
+            return DELTA_DOWN
+        return DELTA_FLAT
+
+    @staticmethod
+    def _delta_background(value: float | None) -> QColor:
+        number = float(value or 0)
+        if number > 0:
+            return QColor("#dcfce7")
+        if number < 0:
+            return QColor("#fee2e2")
+        return QColor("#ffffff")
+
+    def _set_stat_card(self, card: QFrame, title: str, value: str, extra: str = "", delta: float | None = None) -> None:
+        card.title_label.setText(title)
+        card.value_label.setText(value)
+        card.extra_label.setText(extra)
+        if delta is None:
+            card.extra_label.setStyleSheet("")
+        else:
+            color = self._delta_color(delta).name()
+            card.extra_label.setStyleSheet(f"color: {color}; font-weight: 600;")
+
+    def _fill_table(self, table: QTableWidget, headers: list[str], rows: list[list[str]]) -> None:
+        table.clear()
+        table.setColumnCount(len(headers))
+        table.setHorizontalHeaderLabels(headers)
+        table.setRowCount(len(rows))
+        for row_index, row in enumerate(rows):
+            for column, value in enumerate(row):
+                table.setItem(row_index, column, QTableWidgetItem(str(value)))
+
     def run_query(self) -> None:
         values = split_names(self.query_value.toPlainText())
         if not values:
@@ -1200,14 +2073,14 @@ class MainWindow(QMainWindow):
         )
         if hasattr(self, "query_result_summary"):
             self.query_result_summary.setText(f"正在查询：输入 {len(values)} 个值…")
-        refresh = bool(getattr(self, "query_refresh_cache", None) and self.query_refresh_cache.isChecked())
+        excludes = split_names(self.query_exclude.text()) if hasattr(self, "query_exclude") else []
         self.run_task(
             lambda: engine.query_many(
                 field, values, source == "direct", exact, source, extract_target, extract_sheet, source_id,
-                date_field, start_date, end_date, refresh,
+                date_field, start_date, end_date, False, excludes,
             ),
             lambda results: self.show_query_results(results, result_fields, field),
-            "正在刷新缓存并查询…" if refresh else "正在查询缓存…",
+            "正在查询本地库…",
         )
 
     def run_refresh_cache(self) -> None:
@@ -1223,13 +2096,17 @@ class MainWindow(QMainWindow):
         else:
             QMessageBox.information(self, "无需刷新", "汇总库本身就是本地数据，直接查询即可。")
             return
-        self.run_task(job, self.refresh_cache_finished, "正在刷新缓存…", self.refresh_cache_button)
+        self.run_task(job, self.refresh_cache_finished, "正在从表格同步到本地库…", self.refresh_cache_button)
 
     def refresh_cache_finished(self, result: dict[str, int]) -> None:
         self.update_query_cache_status()
         self.refresh_query_fields()
         self.refresh_logs()
-        QMessageBox.information(self, "缓存已更新", f"已缓存 {result.get('rows', 0)} 行。")
+        if result.get("unchanged"):
+            extra = "内容与本地库一致，无需重写。"
+        else:
+            extra = "已用表格最新数据替换本地库。"
+        QMessageBox.information(self, "本地库已同步", f"共 {result.get('rows', 0)} 行。{extra}")
 
     @staticmethod
     def corrected_source(source: str) -> str:
@@ -1455,6 +2332,8 @@ class MainWindow(QMainWindow):
         self._restoring_settings = restoring
         self.refresh_query_source_picker()
         self.refresh_query_fields()
+        self.refresh_analysis_source_picker()
+        self.refresh_analysis_fields()
 
     def on_extract_mode_changed(self) -> None:
         if getattr(self, "_restoring_settings", False):
@@ -1548,12 +2427,21 @@ class MainWindow(QMainWindow):
             box = QMessageBox(self)
             box.setWindowTitle("发现新版本")
             box.setText(f"当前版本：v{APP_VERSION}\n最新版本：v{latest}")
-            box.setInformativeText("软件将自动下载安装包，随后关闭当前版本并启动安装。")
-            install_button = box.addButton("立即下载安装", QMessageBox.AcceptRole)
+            can_install = sys.platform == "win32" and bool(info.get("installer_url"))
+            if can_install:
+                box.setInformativeText("软件将自动下载安装包，随后关闭当前版本并启动安装。")
+                install_button = box.addButton("立即下载安装", QMessageBox.AcceptRole)
+                box.addButton("稍后", QMessageBox.RejectRole)
+                box.exec()
+                if box.clickedButton() is install_button:
+                    self.download_and_install_update(info)
+                return
+            box.setInformativeText("请到 GitHub Releases 下载当前系统对应的安装包。")
+            open_button = box.addButton("打开下载页", QMessageBox.AcceptRole)
             box.addButton("稍后", QMessageBox.RejectRole)
             box.exec()
-            if box.clickedButton() is install_button:
-                self.download_and_install_update(info)
+            if box.clickedButton() is open_button:
+                QDesktopServices.openUrl(QUrl(str(info.get("url") or RELEASES_URL)))
             return
         QMessageBox.information(self, "已是最新", f"当前已经是最新版本 v{APP_VERSION}。")
 
@@ -1567,7 +2455,11 @@ class MainWindow(QMainWindow):
             self._set_update_buttons_enabled(True)
             self.tasks.remove(task)
             task.deleteLater()
-            installer = Path(str(path))
+            installer = Path(str(path)).resolve()
+            updates = (self.store.data_dir / "updates").resolve()
+            if installer.parent != updates:
+                QMessageBox.critical(self, "更新失败", "安装包路径不在本机更新目录，已拒绝启动。")
+                return
             QMessageBox.information(self, "下载完成", "安装包已下载，将关闭当前软件并启动安装程序。")
             subprocess.Popen([str(installer)], cwd=str(installer.parent))
             QApplication.quit()
@@ -1701,9 +2593,27 @@ class MainWindow(QMainWindow):
             self.refresh_sources()
             self.refresh_extract_source_picker()
             self.refresh_query_source_picker()
+            self.refresh_analysis_source_picker()
             self.update_output_destination()
             self.update_extract_source_visibility()
             self.update_query_date_controls()
+            if hasattr(self, "analysis_source_pick"):
+                self.analysis_names.setText(str(self.store.get("analysis_names", "") or ""))
+                self.analysis_exclude.setText(str(self.store.get("analysis_exclude_keywords", "") or ""))
+                saved_compare = UI_RANGE_ALIASES.get(str(self.store.get("analysis_compare_mode", "month") or "month"), "month")
+                if saved_compare in COMPARE_MODES:
+                    self.analysis_range.setCurrentIndex(COMPARE_MODES.index(saved_compare))
+                self.analysis_compare_enabled.setChecked(bool(self.store.get("analysis_compare_enabled", False)))
+                saved_ref = QDate.fromString(str(self.store.get("analysis_reference_date", "") or ""), "yyyy-MM-dd")
+                if saved_ref.isValid():
+                    self.analysis_reference.setDate(saved_ref)
+                self.analysis_count_check.setChecked(bool(self.store.get("analysis_show_count", True)))
+                chart_mode = str(self.store.get("analysis_chart_mode", "line") or "line")
+                self.analysis_chart_line.setChecked(chart_mode != "pie")
+                self.analysis_chart_pie.setChecked(chart_mode == "pie")
+                self.analysis_chart.set_mode("pie" if chart_mode == "pie" else "line")
+                self.sync_analysis_periods()
+                self.refresh_analysis_fields()
             self.refresh_field_controls()
         finally:
             self._restoring_settings = restoring
@@ -1746,6 +2656,339 @@ class MainWindow(QMainWindow):
         task.start()
 
 
+def format_number(value: float | None, digits: int = 2) -> str:
+    if value is None:
+        return "—"
+    number = float(value)
+    if abs(number - round(number)) < 1e-9:
+        return str(int(round(number)))
+    return f"{number:.{digits}f}"
+
+
+def format_delta(value: float | None, percent: float | None = None) -> str:
+    if value is None:
+        return "—"
+    sign = "+" if value > 0 else ""
+    text = f"{sign}{format_number(value)}"
+    if percent is not None:
+        percent_sign = "+" if percent > 0 else ""
+        text += f" ({percent_sign}{percent:.1f}%)"
+    return text
+
+
+def delta_percent(current: float, previous: float) -> float | None:
+    if previous == 0:
+        return None if current == 0 else 100.0
+    return (current - previous) / previous * 100.0
+
+
+def _pie_contrast(color: QColor) -> QColor:
+    luma = 0.2126 * color.red() + 0.7152 * color.green() + 0.0722 * color.blue()
+    return QColor("#ffffff") if luma < 150 else QColor("#0f172a")
+
+
+def _short_label(text: str, limit: int = 10) -> str:
+    value = str(text or "").strip()
+    if len(value) <= limit:
+        return value
+    return value[: limit - 1] + "…"
+
+
+def format_percent(value: float | None) -> str:
+    if value is None:
+        return "—"
+    sign = "+" if value > 0 else ""
+    return f"{sign}{value:.1f}%"
+
+
+class LineChartWidget(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(180)
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.setMouseTracking(True)
+        self.title = "每日曲线"
+        self.line_title = "每日曲线"
+        self.pie_title = "人员占比"
+        self.mode = "line"
+        self.series: list[tuple[str, list[tuple[str, float]], QColor]] = []
+        self.slices: list[tuple[str, float, QColor]] = []
+        self._line_hits: list[dict] = []
+        self._pie_hits: list[dict] = []
+        self._pie_center: tuple[float, float, float] | None = None
+        self._hover_key = ""
+        self._hover_x: float | None = None
+
+    def set_series(self, series: list[tuple[str, list[tuple[str, float]], QColor]], title: str = "每日曲线") -> None:
+        self.series = series
+        self.line_title = title
+        if self.mode == "line":
+            self.title = title
+        self._clear_hover()
+        self.update()
+
+    def set_slices(self, slices: list[tuple[str, float, QColor]], title: str = "人员占比") -> None:
+        self.slices = slices
+        self.pie_title = title
+        if self.mode == "pie":
+            self.title = title
+        self._clear_hover()
+        self.update()
+
+    def set_mode(self, mode: str) -> None:
+        self.mode = "pie" if mode == "pie" else "line"
+        self.title = self.pie_title if self.mode == "pie" else self.line_title
+        self._clear_hover()
+        self.update()
+
+    def _clear_hover(self) -> None:
+        self._hover_key = ""
+        self._hover_x = None
+        QToolTip.hideText()
+
+    def leaveEvent(self, event) -> None:
+        if self._hover_key or self._hover_x is not None:
+            self._clear_hover()
+            self.update()
+        super().leaveEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        pos = event.position() if hasattr(event, "position") else event.pos()
+        if self.mode == "pie":
+            self._hover_pie(float(pos.x()), float(pos.y()), event)
+        else:
+            self._hover_line(float(pos.x()), float(pos.y()), event)
+        event.accept()
+
+    def _show_tip(self, event, text: str) -> None:
+        pos = event.globalPosition().toPoint() if hasattr(event, "globalPosition") else self.mapToGlobal(QPoint(int(event.pos().x()), int(event.pos().y())))
+        QToolTip.showText(pos, text, self)
+
+    def _hover_line(self, mx: float, my: float, event) -> None:
+        if not self._line_hits:
+            self._clear_hover()
+            return
+        nearest = min(self._line_hits, key=lambda item: (item["x"] - mx) ** 2 + (item["y"] - my) ** 2)
+        dist = math.hypot(nearest["x"] - mx, nearest["y"] - my)
+        x_dist = min(abs(item["x"] - mx) for item in self._line_hits)
+        if dist > 16 and x_dist > 18:
+            if self._hover_key:
+                self._clear_hover()
+                self.update()
+            return
+        slot = [item for item in self._line_hits if abs(item["x"] - nearest["x"]) < 0.5]
+        lines = [str(nearest["x_label"])]
+        for item in slot:
+            lines.append(f"{item['label']}：{format_number(item['value'])}")
+        text = "\n".join(lines)
+        if text != self._hover_key or self._hover_x != nearest["x"]:
+            self._hover_key = text
+            self._hover_x = nearest["x"]
+            self.update()
+        self._show_tip(event, text)
+
+    def _hover_pie(self, mx: float, my: float, event) -> None:
+        if not self._pie_hits or not self._pie_center:
+            self._clear_hover()
+            return
+        cx, cy, radius = self._pie_center
+        if math.hypot(mx - cx, my - cy) > radius + 6:
+            if self._hover_key:
+                self._clear_hover()
+                self.update()
+            return
+        deg = math.degrees(math.atan2(-(my - cy), mx - cx))
+        if deg < 0:
+            deg += 360
+        angle16 = int(round(deg * 16)) % (360 * 16)
+        hit = None
+        for item in self._pie_hits:
+            delta = (item["start"] - angle16) % (360 * 16)
+            if delta <= abs(item["span"]):
+                hit = item
+                break
+        if hit is None:
+            if self._hover_key:
+                self._clear_hover()
+                self.update()
+            return
+        text = f"{hit['label']}\n{format_number(hit['value'])}（{hit['percent']:.0f}%）"
+        if text != self._hover_key:
+            self._hover_key = text
+        self._show_tip(event, text)
+
+    def paintEvent(self, event) -> None:  # noqa: ARG002
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        bounds = self.rect().adjusted(4, 4, -4, -4)
+        painter.fillRect(bounds, QColor("#ffffff"))
+        painter.setPen(QPen(QColor("#dce5ef")))
+        painter.drawRoundedRect(bounds.adjusted(0, 0, -1, -1), 8, 8)
+        self._line_hits = []
+        self._pie_hits = []
+        self._pie_center = None
+        if self.mode == "pie":
+            self._paint_pie(painter, bounds)
+        else:
+            self._paint_line(painter, bounds)
+
+    def _paint_line(self, painter: QPainter, bounds) -> None:
+        if not any(points for _label, points, _color in self.series):
+            painter.setPen(QColor("#94a3b8"))
+            painter.drawText(bounds, Qt.AlignCenter, "暂无曲线数据")
+            return
+        painter.setPen(QColor("#10213a"))
+        painter.setFont(QFont("Microsoft YaHei UI", 10, QFont.DemiBold))
+        painter.drawText(bounds.adjusted(12, 8, -12, 0), Qt.AlignTop | Qt.AlignLeft, self.title)
+        painter.setFont(QFont("Microsoft YaHei UI", 8))
+        metrics = QFontMetrics(painter.font())
+        legend_x = bounds.left() + 12
+        legend_y = bounds.top() + 28
+        legend_right = bounds.right() - 12
+        for label, _points, color in self.series:
+            width = 18 + metrics.horizontalAdvance(label) + 12
+            if legend_x + width > legend_right and legend_x > bounds.left() + 12:
+                legend_x = bounds.left() + 12
+                legend_y += 16
+            painter.setPen(Qt.NoPen)
+            painter.setBrush(color)
+            painter.drawRoundedRect(legend_x, legend_y + 3, 10, 10, 2, 2)
+            painter.setPen(QColor("#334155"))
+            painter.drawText(legend_x + 14, legend_y, width - 14, 16, Qt.AlignLeft | Qt.AlignVCenter, label)
+            legend_x += width
+        plot = bounds.adjusted(48, legend_y - bounds.top() + 20, -16, -28)
+        values = [value for _label, points, _color in self.series for _label_x, value in points]
+        max_value = max(values) if values else 1.0
+        if max_value <= 0:
+            max_value = 1.0
+        max_value *= 1.12
+        painter.setFont(QFont("Microsoft YaHei UI", 8))
+        painter.setPen(QColor("#94a3b8"))
+        for step in range(5):
+            ratio = step / 4
+            y = plot.bottom() - (plot.height() * ratio)
+            painter.drawLine(plot.left(), int(y), plot.right(), int(y))
+            painter.drawText(6, int(y) - 8, plot.left() - 10, 16, Qt.AlignRight | Qt.AlignVCenter, format_number(max_value * ratio))
+        labels = next((points for _label, points, _color in self.series if points), [])
+        count = max((len(points) for _label, points, _color in self.series), default=1) or 1
+        skip = max(1, (len(labels) + 7) // 8)
+        for index, (label, _value) in enumerate(labels):
+            if index % skip != 0 and index != len(labels) - 1:
+                continue
+            x = plot.left() if count == 1 else plot.left() + plot.width() * index / max(count - 1, 1)
+            painter.drawText(int(x) - 36, plot.bottom() + 4, 72, 18, Qt.AlignHCenter | Qt.AlignTop, label)
+        hits: list[dict] = []
+        for label, points, color in self.series:
+            painter.setPen(QPen(color, 2.4))
+            last = None
+            for index, (x_label, value) in enumerate(points):
+                x = plot.left() if count == 1 else plot.left() + plot.width() * index / max(count - 1, 1)
+                y = plot.bottom() - (value / max_value) * plot.height()
+                point = QPointF(x, y)
+                if last is not None:
+                    painter.drawLine(last, point)
+                painter.setBrush(color)
+                painter.setPen(QPen(color, 2.4))
+                painter.drawEllipse(point, 3.0, 3.0)
+                hits.append({"x": x, "y": y, "label": label, "x_label": x_label, "value": value, "color": color})
+                last = point
+        self._line_hits = hits
+        if self._hover_x is not None:
+            for item in hits:
+                if abs(item["x"] - self._hover_x) < 0.5:
+                    painter.setPen(QPen(QColor("#ffffff"), 2))
+                    painter.setBrush(item["color"])
+                    painter.drawEllipse(QPointF(item["x"], item["y"]), 5.4, 5.4)
+                    painter.setPen(QPen(item["color"], 1.6))
+                    painter.drawEllipse(QPointF(item["x"], item["y"]), 3.2, 3.2)
+
+    def _paint_pie(self, painter: QPainter, bounds) -> None:
+        slices = [(label, value, color) for label, value, color in self.slices if value > 0]
+        painter.setPen(QColor("#10213a"))
+        painter.setFont(QFont("Microsoft YaHei UI", 10, QFont.DemiBold))
+        painter.drawText(bounds.adjusted(12, 8, -12, 0), Qt.AlignTop | Qt.AlignLeft, self.title)
+        if not slices:
+            painter.setPen(QColor("#94a3b8"))
+            painter.drawText(bounds, Qt.AlignCenter, "暂无饼图数据")
+            return
+        total = sum(value for _label, value, _color in slices)
+        side = min(bounds.width() - 280, bounds.height() - 48)
+        side = max(120, side)
+        pie = QRect(bounds.center().x() - side // 2, bounds.top() + 32, side, side)
+        if pie.bottom() > bounds.bottom() - 8:
+            pie.moveTop(max(bounds.top() + 28, bounds.bottom() - 8 - pie.height()))
+        cx = pie.center().x()
+        cy = pie.center().y()
+        radius = pie.width() / 2
+        self._pie_center = (float(cx), float(cy), float(radius))
+        items = []
+        start = 90 * 16
+        for label, value, color in slices:
+            span = max(1, int(round(360 * 16 * value / total))) if total else 0
+            painter.setBrush(color)
+            painter.setPen(QPen(QColor("#ffffff"), 1.5))
+            painter.drawPie(pie, start, -span)
+            mid = (start - span / 2) / 16.0
+            rad = math.radians(mid)
+            percent = (value / total * 100) if total else 0
+            items.append({
+                "label": label,
+                "value": value,
+                "color": color,
+                "percent": percent,
+                "cos": math.cos(rad),
+                "sin": math.sin(rad),
+                "rad": rad,
+            })
+            self._pie_hits.append({
+                "start": start,
+                "span": -span,
+                "label": label,
+                "value": value,
+                "percent": percent,
+            })
+            start -= span
+        painter.setFont(QFont("Microsoft YaHei UI", 9, QFont.DemiBold))
+        for item in items:
+            if item["percent"] < 6:
+                continue
+            px = cx + radius * 0.62 * item["cos"]
+            py = cy - radius * 0.62 * item["sin"]
+            painter.setPen(_pie_contrast(item["color"]))
+            painter.drawText(int(px - 22), int(py - 9), 44, 18, Qt.AlignCenter, f"{item['percent']:.0f}%")
+        left_items = sorted((item for item in items if item["cos"] < 0), key=lambda item: -item["sin"])
+        right_items = sorted((item for item in items if item["cos"] >= 0), key=lambda item: -item["sin"])
+        painter.setFont(QFont("Microsoft YaHei UI", 8))
+        self._paint_pie_labels(painter, left_items, pie, bounds, cx, cy, radius, False)
+        self._paint_pie_labels(painter, right_items, pie, bounds, cx, cy, radius, True)
+
+    def _paint_pie_labels(self, painter, items, pie, bounds, cx, cy, radius, right_side: bool) -> None:
+        if not items:
+            return
+        top = pie.top()
+        gap = max(18, min(26, (pie.height() - 8) / max(len(items), 1)))
+        for index, item in enumerate(items):
+            text = f"{_short_label(item['label'])}  {format_number(item['value'])}  {item['percent']:.0f}%"
+            metrics = QFontMetrics(painter.font())
+            text_w = metrics.horizontalAdvance(text) + 4
+            y = top + index * gap + 4
+            x_edge = cx + radius * item["cos"]
+            y_edge = cy - radius * item["sin"]
+            x_mid = cx + (radius + 14) * item["cos"]
+            y_mid = cy - (radius + 14) * item["sin"]
+            if right_side:
+                x_text = min(bounds.right() - 10 - text_w, pie.right() + 18)
+                x_elbow = x_text - 6
+            else:
+                x_text = max(bounds.left() + 10, pie.left() - 18 - text_w)
+                x_elbow = x_text + text_w + 6
+            painter.setPen(QPen(item["color"], 1.4))
+            painter.drawLine(QPointF(x_edge, y_edge), QPointF(x_mid, y_mid))
+            painter.drawLine(QPointF(x_mid, y_mid), QPointF(x_elbow, y + 8))
+            painter.setPen(QColor("#1e293b"))
+            painter.drawText(int(x_text), int(y), text_w, 16, Qt.AlignVCenter | (Qt.AlignLeft if right_side else Qt.AlignRight), text)
+
+
 STYLE = """
 QMainWindow, QWidget { background: #f7f9fc; color: #172033; font-family: "Microsoft YaHei UI"; font-size: 13px; }
 #sidebar { background: #0b2748; }
@@ -1760,6 +3003,9 @@ QMainWindow, QWidget { background: #f7f9fc; color: #172033; font-family: "Micros
 #navigation::item:hover { background: #16446f; }
 #pageTitle { font-size: 24px; font-weight: 700; color: #10213a; }
 #muted { color: #64748b; }
+#sectionTitle { font-size: 13px; font-weight: 700; color: #334155; }
+#statCard { background: white; border: 1px solid #dce5ef; border-radius: 10px; }
+#statValue { font-size: 15px; font-weight: 700; color: #10213a; }
 #card { background: white; border: 1px solid #dce5ef; border-radius: 10px; padding: 16px; }
 #columnMapRow { background: white; border: 1px solid #e2eaf2; border-radius: 8px; }
 #columnLetter { font-weight: 600; }
@@ -1769,6 +3015,10 @@ QPushButton:hover { border-color: #0ea5e9; color: #0369a1; }
 QPushButton:disabled { color: #94a3b8; background: #e2e8f0; }
 QPushButton#primary { background: #087fbb; border-color: #087fbb; color: white; font-weight: 600; }
 QPushButton#primary:hover { background: #0369a1; }
+QPushButton#chartToggle { padding: 4px 8px; }
+QPushButton#chartToggle:checked { background: #087fbb; border-color: #087fbb; color: white; font-weight: 600; }
+QCheckBox#chipCheck { spacing: 4px; padding: 2px 8px; background: white; border: 1px solid #cbd5e1; border-radius: 6px; }
+QCheckBox#chipCheck:checked { background: #e8f5ff; border-color: #087fbb; color: #0369a1; }
 QLineEdit, QTextEdit, QComboBox, QSpinBox, QDateEdit { background: white; border: 1px solid #cbd5e1; border-radius: 6px; padding: 7px; selection-background-color: #0ea5e9; }
 QTableWidget { background: white; alternate-background-color: #f8fafc; border: 1px solid #dce5ef; border-radius: 8px; gridline-color: #e8edf3; }
 QHeaderView::section { background: #edf3f8; color: #334155; border: 0; border-bottom: 1px solid #d7e0e9; padding: 9px; font-weight: 600; }

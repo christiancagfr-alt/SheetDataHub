@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sqlite3
@@ -129,6 +130,12 @@ class SourceCache:
     def path(self, source_id: str) -> Path:
         return self.directory / f"{self._safe_id(source_id)}.sqlite"
 
+    @staticmethod
+    def _prepare(conn: sqlite3.Connection) -> None:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        conn.execute("PRAGMA temp_store=MEMORY")
+
     def has(self, source_id: str) -> bool:
         path = self.path(source_id)
         return path.exists() and path.stat().st_size > 0
@@ -140,6 +147,7 @@ class SourceCache:
             temp.unlink()
         conn = sqlite3.connect(temp)
         try:
+            self._prepare(conn)
             conn.executescript(
                 """
                 CREATE TABLE records (
@@ -177,6 +185,7 @@ class SourceCache:
             conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", ("headers", json.dumps(keys, ensure_ascii=False)))
             conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", ("updated_at", datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
             conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", ("rows", str(len(records))))
+            conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", ("fingerprint", self.content_fingerprint(records)))
             if target:
                 conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", ("target", str(target)))
             conn.commit()
@@ -192,6 +201,7 @@ class SourceCache:
             return []
         conn = sqlite3.connect(self.path(source_id))
         try:
+            self._prepare(conn)
             rows = conn.execute(
                 "SELECT source_id,source_name,spreadsheet_id,sheet_name,row_number,payload,row_hash FROM records"
             ).fetchall()
@@ -201,6 +211,41 @@ class SourceCache:
 
     def headers(self, source_id: str) -> list[str]:
         return [str(item) for item in json.loads(self._meta(source_id, "headers") or "[]")]
+
+    @staticmethod
+    def content_fingerprint(records: list[Record]) -> str:
+        digest = hashlib.sha256()
+        for record in sorted(records, key=lambda item: (item.sheet_name, item.row_number, item.row_hash)):
+            digest.update(f"{record.sheet_name}\0{record.row_number}\0{record.row_hash}\n".encode("utf-8"))
+        return digest.hexdigest()
+
+    def merge(
+        self,
+        source_id: str,
+        records: list[Record],
+        headers: list[str] | None = None,
+        target: str = "",
+    ) -> dict[str, int | bool]:
+        new_fp = self.content_fingerprint(records)
+        existed = self.has(source_id)
+        if existed and self._meta(source_id, "fingerprint") == new_fp:
+            return {
+                "rows": len(records),
+                "inserted": 0,
+                "updated": 0,
+                "deleted": 0,
+                "skipped": len(records),
+                "unchanged": True,
+            }
+        self.replace(source_id, records, headers, target)
+        return {
+            "rows": len(records),
+            "inserted": 0 if existed else len(records),
+            "updated": len(records) if existed else 0,
+            "deleted": 0,
+            "skipped": 0,
+            "unchanged": False,
+        }
 
     def updated_at(self, source_id: str) -> str:
         return self._meta(source_id, "updated_at")
