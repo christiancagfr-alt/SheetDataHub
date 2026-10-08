@@ -139,7 +139,7 @@ def installer_url_allowed(url: str) -> bool:
     return any(text.startswith(prefix) for prefix in INSTALLER_URL_PREFIXES)
 
 
-def fetch_latest_release(timeout: int = 20) -> dict[str, Any]:
+def fetch_latest_release(timeout: int = 20, platform_name: str | None = None) -> dict[str, Any]:
     response = requests.get(
         f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest",
         timeout=timeout,
@@ -155,7 +155,7 @@ def fetch_latest_release(timeout: int = 20) -> dict[str, Any]:
     tag = str(data.get("tag_name") or "").strip()
     version = tag.lstrip("vV") or APP_VERSION
     assets = list(data.get("assets") or [])
-    installer = pick_current_installer(assets)
+    installer = pick_current_installer(assets, platform_name)
     installer_name = _asset_filename(installer or {})
     installer_url = str((installer or {}).get("browser_download_url") or "")
     kind = installer_kind(installer_name, installer_url)

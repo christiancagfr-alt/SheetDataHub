@@ -110,7 +110,7 @@ class RuleTests(unittest.TestCase):
                 }
 
         with patch("sheet_hub.version.requests.get", return_value=FakeJsonResponse()):
-            info = fetch_latest_release()
+            info = fetch_latest_release(platform_name="win32")
         self.assertTrue(installer_url_allowed(info["installer_url"]))
         self.assertIn("github.com/", info["installer_url"])
         self.assertFalse(installer_url_allowed("https://example.test/setup.exe"))
