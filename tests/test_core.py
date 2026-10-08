@@ -31,6 +31,7 @@ from sheet_hub.engine import (
 )
 from sheet_hub.models import Record, SourceConfig
 from sheet_hub.source_reader import (
+    CredentialPool,
     SourceReader,
     _google_download_host_ok,
     canonicalize,
@@ -99,8 +100,8 @@ class RuleTests(unittest.TestCase):
                     "tag_name": "v9.9.9",
                     "html_url": "https://example.test/release",
                     "assets": [{
-                        "name": "SheetDataHub-Setup.exe",
-                        "browser_download_url": "https://github.com/christiancagfr-alt/SheetDataHub/releases/download/v9.9.9/SheetDataHub-Setup.exe",
+                        "name": "SheetDataHub-Setup-v9.9.9.exe",
+                        "browser_download_url": "https://github.com/christiancagfr-alt/SheetDataHub/releases/download/v9.9.9/SheetDataHub-Setup-v9.9.9.exe",
                         "size": 1024 * 1024 + 2,
                     }],
                 }
@@ -147,6 +148,40 @@ class RuleTests(unittest.TestCase):
         ):
             with self.assertRaises(RuntimeError):
                 download_release_installer(info, directory)
+
+    def test_credential_pool_rotates_on_429(self):
+        class QuotaError(Exception):
+            def __init__(self):
+                self.response = SimpleNamespace(status_code=429)
+
+        used: list[str] = []
+
+        def factory(path):
+            return path
+
+        def operation(client):
+            used.append(Path(client).name)
+            if len(used) == 1:
+                raise QuotaError()
+            return "ok"
+
+        with tempfile.TemporaryDirectory() as directory, patch("sheet_hub.source_reader.time.sleep"):
+            first = Path(directory) / "a.json"
+            second = Path(directory) / "b.json"
+            first.write_text("{}", encoding="utf-8")
+            second.write_text("{}", encoding="utf-8")
+            pool = CredentialPool([str(first), str(second)], client_factory=factory)
+            self.assertEqual(pool.call(operation), "ok")
+        self.assertEqual(used, ["a.json", "b.json"])
+
+    def test_credential_paths_migrate_legacy_setting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            store.set("credential_path", r"C:\keys\one.json")
+            self.assertEqual(store.list_credential_paths(), [r"C:\keys\one.json"])
+            store.set_credential_paths([r"C:\keys\one.json", r"C:\keys\two.json"])
+            self.assertEqual(store.list_credential_paths(), [r"C:\keys\one.json", r"C:\keys\two.json"])
+            self.assertEqual(store.get("credential_path"), r"C:\keys\one.json")
 
     def test_google_429_is_retried(self):
         class QuotaError(Exception):
@@ -283,14 +318,19 @@ class DatabaseTests(unittest.TestCase):
             self.assertFalse(target_store.was_extracted("old"))
             self.assertTrue(target_store.was_extracted("keep"))
             self.assertEqual(payload["settings"].get("credential_path"), "")
+            self.assertEqual(payload["settings"].get("credential_paths"), [])
             self.assertEqual(payload["sources"][0].get("credential_path"), "")
-            target_store.set("credential_path", r"D:\local\sa.json")
+            target_store.set_credential_paths([r"D:\local\sa.json"])
             target_store.import_config({
                 **payload,
-                "settings": {**payload["settings"], "credential_path": r"C:\stolen\sa.json"},
+                "settings": {
+                    **payload["settings"],
+                    "credential_path": r"C:\stolen\sa.json",
+                    "credential_paths": [r"C:\stolen\sa.json"],
+                },
                 "sources": [{**payload["sources"][0], "credential_path": r"C:\stolen\sa.json"}],
             })
-            self.assertEqual(target_store.get("credential_path"), r"D:\local\sa.json")
+            self.assertEqual(target_store.list_credential_paths(), [r"D:\local\sa.json"])
             self.assertEqual(target_store.load_sources()[0].credential_path, "")
 
     def test_sharding_and_query(self):

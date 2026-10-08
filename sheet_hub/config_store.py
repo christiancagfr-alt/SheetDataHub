@@ -94,6 +94,8 @@ class ConfigStore:
             "write_aggregate": True,
             "max_rows_per_db": 500000,
             "credential_path": "",
+            "credential_paths": [],
+            "credential_rotate_index": 0,
             "column_schema_enabled": False,
             "column_schema": [],
             "google_output_url": "",
@@ -157,6 +159,58 @@ class ConfigStore:
         if not any(str(name).strip().casefold() == "手机号码" for name in phone_aliases):
             phone_aliases.append("手机号码")
             self.set("field_aliases", aliases)
+        self.set_credential_paths(self.list_credential_paths())
+
+    def list_credential_paths(self) -> list[str]:
+        raw = self.get("credential_paths", [])
+        if isinstance(raw, str):
+            raw = [raw]
+        if not isinstance(raw, list):
+            raw = []
+        legacy = str(self.get("credential_path", "") or "").strip()
+        result: list[str] = []
+        seen: set[str] = set()
+        for item in [*raw, legacy]:
+            text = str(item or "").strip()
+            key = text.casefold()
+            if text and key not in seen:
+                seen.add(key)
+                result.append(text)
+        return result
+
+    def set_credential_paths(self, paths: list[str] | None) -> None:
+        cleaned: list[str] = []
+        seen: set[str] = set()
+        for item in paths or []:
+            text = str(item or "").strip()
+            key = text.casefold()
+            if text and key not in seen:
+                seen.add(key)
+                cleaned.append(text)
+        self.set("credential_paths", cleaned)
+        self.set("credential_path", cleaned[0] if cleaned else "")
+        count = len(cleaned)
+        index = int(self.get("credential_rotate_index", 0) or 0)
+        self.set("credential_rotate_index", index % count if count else 0)
+
+    def take_credential_start(self, extra: str = "") -> tuple[list[str], int]:
+        extra = str(extra or "").strip()
+        pool = self.list_credential_paths()
+        if extra:
+            ordered = [extra, *[item for item in pool if item.casefold() != extra.casefold()]]
+            return ordered, 0
+        if not pool:
+            return [], 0
+        start = int(self.get("credential_rotate_index", 0) or 0) % len(pool)
+        return pool[start:] + pool[:start], start
+
+    def advance_credential_index(self, steps: int = 1) -> None:
+        paths = self.list_credential_paths()
+        if not paths:
+            self.set("credential_rotate_index", 0)
+            return
+        current = int(self.get("credential_rotate_index", 0) or 0)
+        self.set("credential_rotate_index", (current + max(1, int(steps))) % len(paths))
 
     def get(self, key: str, default: Any = None) -> Any:
         if key in self._settings_cache:
@@ -221,6 +275,8 @@ class ConfigStore:
     def export_config(self) -> dict[str, Any]:
         settings = self.all_settings()
         settings["credential_path"] = ""
+        settings["credential_paths"] = []
+        settings.pop("credential_rotate_index", None)
         sources = []
         for source in self.load_sources():
             item = source.to_dict()
@@ -248,7 +304,12 @@ class ConfigStore:
         self._settings_cache.clear()
         with self._connect() as conn:
             for key, value in settings.items():
-                if not isinstance(key, str) or key in {"app_version", "credential_path"}:
+                if not isinstance(key, str) or key in {
+                    "app_version",
+                    "credential_path",
+                    "credential_paths",
+                    "credential_rotate_index",
+                }:
                     continue
                 conn.execute(
                     "INSERT INTO settings(key,value) VALUES(?,?) "

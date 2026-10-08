@@ -26,7 +26,14 @@ from .models import (
     Record,
     SourceConfig,
 )
-from .source_reader import SourceReader, column_index, google_retry, schema_field_names, spreadsheet_id
+from .source_reader import (
+    CredentialPool,
+    SourceReader,
+    column_index,
+    normalize_credential_paths,
+    schema_field_names,
+    spreadsheet_id,
+)
 
 
 ProgressFn = Callable[[str], None]
@@ -328,11 +335,26 @@ class DataEngine:
     ) -> SourceReader:
         resolved = schema if schema is not None else self._schema_for_source(source, use_schema)
         excludes = self.store.get("global_excludes", []) if global_excludes is None else global_excludes
+        extra = source.credential_path if source is not None else ""
         return SourceReader(
             self.field_aliases(),
             excludes,
             lambda level, message: self._log(operation, level, message),
             resolved,
+            credential_paths=self._credential_paths(extra),
+        )
+
+    def _credential_paths(self, extra: str = "") -> list[str]:
+        ordered, _ = self.store.take_credential_start(extra)
+        return ordered
+
+    def _google_pool(self, operation: str, extra: str = "") -> CredentialPool:
+        paths = self._credential_paths(extra)
+        if not paths:
+            raise ValueError("请在设置里添加至少一个服务账号 JSON，并把表格共享给这些账号")
+        return CredentialPool(
+            paths,
+            lambda level, message: self._log(operation, level, message),
         )
 
     def read_sources(self, operation: str = "读取数据源", source_id: str = "") -> list[Record]:
@@ -345,10 +367,10 @@ class DataEngine:
         failures = 0
         for source in sources:
             try:
-                if not source.credential_path:
-                    source.credential_path = str(self.store.get("credential_path", "")).strip()
                 self._log(operation, "INFO", f"开始读取：{source.name}")
                 loaded = self._reader(operation, source=source).read(source)
+                if normalize_credential_paths(source.credential_path, self.store.list_credential_paths()):
+                    self.store.advance_credential_index()
                 records.extend(loaded)
                 self._log(operation, "INFO", f"完成读取：{source.name}，共 {len(loaded)} 行")
             except Exception as exc:
@@ -493,7 +515,6 @@ class DataEngine:
             name="提取表",
             url=path_or_url,
             include_sheets=[sheet],
-            credential_path=str(self.store.get("credential_path", "")).strip(),
         )
         extract_schema = list(self.store.get("extract_column_schema", []) or [])
         use_extract_schema = bool(self.store.get("extract_column_schema_enabled", False) and schema_field_names(extract_schema))
@@ -1541,35 +1562,23 @@ class DataEngine:
         sid = spreadsheet_id(url)
         if not sid:
             raise ValueError("无法识别目标 Google 表格链接")
-        credential = str(self.store.get("credential_path", "")).strip()
-        if not credential:
-            credential = next(
-                (source.credential_path for source in self.store.load_sources() if source.credential_path),
-                "",
-            )
-        if not credential:
-            raise ValueError("写入 Google 表格需要在“设置”中配置服务账号 JSON")
-        logger = lambda level, message: self._log(operation, level, message)
-        client = SourceReader._gspread_client(credential)
-        http = client.http_client
-        metadata = google_retry(
-            lambda: http.fetch_sheet_metadata(
+        pool = self._google_pool(operation)
+        metadata = pool.call(
+            lambda client: client.http_client.fetch_sheet_metadata(
                 sid, params={"fields": "sheets.properties(sheetId,title)"}
-            ),
-            logger,
+            )
         )
         target_name = sheet_name.strip() or "提取结果"
         sheet_names = {item["properties"]["title"] for item in metadata.get("sheets", [])}
         if target_name not in sheet_names:
             return set()
         escaped_name = target_name.replace("'", "''")
-        response = google_retry(
-            lambda: http.values_get(
+        response = pool.call(
+            lambda client: client.http_client.values_get(
                 sid,
                 f"'{escaped_name}'!A:ZZZ",
                 params={"majorDimension": "ROWS", "valueRenderOption": "FORMATTED_VALUE"},
-            ),
-            logger,
+            )
         )
         values = response.get("values") or []
         if len(values) < 2:
@@ -1770,22 +1779,11 @@ class DataEngine:
         sid = spreadsheet_id(url)
         if not sid:
             raise ValueError("无法识别目标 Google 表格链接")
-        credential = str(self.store.get("credential_path", "")).strip()
-        if not credential:
-            credential = next(
-                (source.credential_path for source in self.store.load_sources() if source.credential_path),
-                "",
-            )
-        if not credential:
-            raise ValueError("写入 Google 表格需要在“设置”中配置服务账号 JSON")
-        logger = lambda level, message: self._log(operation, level, message)
-        client = SourceReader._gspread_client(credential)
-        http = client.http_client
-        metadata = google_retry(
-            lambda: http.fetch_sheet_metadata(
+        pool = self._google_pool(operation)
+        metadata = pool.call(
+            lambda client: client.http_client.fetch_sheet_metadata(
                 sid, params={"fields": "sheets.properties(sheetId,title)"}
-            ),
-            logger,
+            )
         )
         target_name = sheet_name.strip() or "提取结果"
         aliases = self.field_aliases()
@@ -1793,8 +1791,8 @@ class DataEngine:
         sheet_names = {item["properties"]["title"] for item in metadata.get("sheets", [])}
         created = target_name not in sheet_names
         if created:
-            google_retry(
-                lambda: http.batch_update(
+            pool.call(
+                lambda client: client.http_client.batch_update(
                     sid,
                     {
                         "requests": [{
@@ -1809,19 +1807,17 @@ class DataEngine:
                             }
                         }]
                     },
-                ),
-                logger,
+                )
             )
             existing_header = []
         else:
             escaped_name = target_name.replace("'", "''")
-            header_response = google_retry(
-                lambda: http.values_get(
+            header_response = pool.call(
+                lambda client: client.http_client.values_get(
                     sid,
                     f"'{escaped_name}'!1:1",
                     params={"majorDimension": "ROWS", "valueRenderOption": "FORMATTED_VALUE"},
-                ),
-                logger,
+                )
             )
             existing_header = (header_response.get("values") or [[]])[0]
             while existing_header and not str(existing_header[-1]).strip():
@@ -1840,8 +1836,8 @@ class DataEngine:
                     for item in metadata.get("sheets", [])
                     if item["properties"]["title"] == target_name
                 )
-                google_retry(
-                    lambda: http.batch_update(
+                pool.call(
+                    lambda client: client.http_client.batch_update(
                         sid,
                         {
                             "requests": [{
@@ -1856,31 +1852,28 @@ class DataEngine:
                                 }
                             }]
                         },
-                    ),
-                    logger,
+                    )
                 )
             for start in range(0, len(rows), 5000):
                 chunk = rows[start:start + 5000]
-                google_retry(
-                    lambda chunk=chunk, start=start: http.values_update(
+                pool.call(
+                    lambda client, chunk=chunk, start=start: client.http_client.values_update(
                         sid,
                         f"'{escaped_name}'!A{2 + start}",
                         params={"valueInputOption": "RAW"},
                         body={"majorDimension": "ROWS", "values": chunk},
-                    ),
-                    logger,
+                    )
                 )
                 self._log(operation, "INFO", f"已插入 Google 工作表“{target_name}”第 2 行：{min(start + len(chunk), len(rows))}/{len(rows)} 行")
             return
         for start in range(0, len(payload), 5000):
             chunk = payload[start:start + 5000]
-            google_retry(
-                lambda chunk=chunk, start=start: http.values_update(
+            pool.call(
+                lambda client, chunk=chunk, start=start: client.http_client.values_update(
                     sid,
                     f"'{escaped_name}'!A{1 + start}",
                     params={"valueInputOption": "RAW"},
                     body={"majorDimension": "ROWS", "values": chunk},
-                ),
-                logger,
+                )
             )
             self._log(operation, "INFO", f"已写入 Google 工作表“{target_name}”：{min(start + len(chunk), len(payload))}/{len(payload)} 行")

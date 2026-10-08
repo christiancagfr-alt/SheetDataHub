@@ -98,20 +98,23 @@ jobs:
         run: |
           $version = "${{ needs.resolve.outputs.version }}"
           New-Item -ItemType Directory -Force -Path release-assets | Out-Null
-          Compress-Archive -Path dist-onedir\SheetDataHub -DestinationPath "release-assets\SheetDataHub-windows.zip" -Force
-          Get-FileHash -Algorithm SHA256 -LiteralPath "release-assets\SheetDataHub-windows.zip" |
+          $zip = "release-assets\SheetDataHub-windows-v$version.zip"
+          Compress-Archive -Path dist-onedir\SheetDataHub -DestinationPath $zip -Force
+          Get-FileHash -Algorithm SHA256 -LiteralPath $zip |
             ForEach-Object { $_.Hash.ToLowerInvariant() } |
-            Set-Content -Path "release-assets\SheetDataHub-windows.zip.sha256" -Encoding ascii -NoNewline
+            Set-Content -Path "$zip.sha256" -Encoding ascii -NoNewline
       - name: Build installer
         shell: pwsh
         run: |
+          $version = "${{ needs.resolve.outputs.version }}"
           python -m PyInstaller --noconfirm --clean --distpath dist-installer --workpath build-installer SheetDataHubInstaller.spec
           $setup = Get-ChildItem dist-installer -Filter *.exe | Select-Object -First 1
           if (-not $setup) { throw "Installer exe not found" }
-          Copy-Item -Path $setup.FullName -Destination "release-assets\SheetDataHub-Setup.exe" -Force
-          Get-FileHash -Algorithm SHA256 -LiteralPath "release-assets\SheetDataHub-Setup.exe" |
+          $dest = "release-assets\SheetDataHub-Setup-v$version.exe"
+          Copy-Item -Path $setup.FullName -Destination $dest -Force
+          Get-FileHash -Algorithm SHA256 -LiteralPath $dest |
             ForEach-Object { $_.Hash.ToLowerInvariant() } |
-            Set-Content -Path "release-assets\SheetDataHub-Setup.exe.sha256" -Encoding ascii -NoNewline
+            Set-Content -Path "$dest.sha256" -Encoding ascii -NoNewline
           Get-ChildItem release-assets | Format-Table Name, Length
       - name: Attest Windows artifacts
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be
@@ -142,6 +145,7 @@ jobs:
       - name: Build macOS app
         run: |
           set -euo pipefail
+          VERSION="${{ needs.resolve.outputs.version }}"
           python -m PyInstaller --noconfirm --clean --distpath dist-onedir SheetDataHub.spec
           mkdir -p release-assets dist/release
           APP=""
@@ -157,9 +161,18 @@ jobs:
             ls -laR dist-onedir || true
             exit 1
           fi
-          ZIP="release-assets/SheetDataHub-macos-arm64.zip"
+          ZIP="release-assets/SheetDataHub-macos-arm64-v${VERSION}.zip"
           ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
           shasum -a 256 "$ZIP" | awk '{print $1}' > "${ZIP}.sha256"
+          STAGE="dist/dmg_stage"
+          rm -rf "$STAGE"
+          mkdir -p "$STAGE"
+          ditto "$APP" "$STAGE/SheetDataHub.app"
+          ln -s /Applications "$STAGE/Applications"
+          DMG="release-assets/SheetDataHub-macos-arm64-v${VERSION}.dmg"
+          hdiutil create -volname "SheetDataHub ${VERSION}" -srcfolder "$STAGE" -ov -format UDZO "$DMG"
+          shasum -a 256 "$DMG" | awk '{print $1}' > "${DMG}.sha256"
+          rm -rf "$STAGE"
           ls -la release-assets
       - name: Attest macOS artifacts
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be

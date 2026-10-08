@@ -270,6 +270,7 @@ class SourceDialog(QDialog):
         self.header_row.setRange(1, 100)
         self.header_row.setValue(source.header_row if source else 1)
         self.credential = QLineEdit(source.credential_path if source else "")
+        self.credential.setPlaceholderText("留空则使用设置里的服务账号池（轮询）")
         credential_button = QPushButton("选择…")
         credential_button.clicked.connect(self.choose_credential)
         credential_row = QHBoxLayout()
@@ -1010,14 +1011,26 @@ class MainWindow(QMainWindow):
         form = QFormLayout(card)
         self.global_excludes = QTextEdit("\n".join(self.store.get("global_excludes", [])))
         self.global_excludes.setMaximumHeight(130)
-        self.default_credential = QLineEdit(self.store.get("credential_path", ""))
-        choose = QPushButton("选择…")
-        choose.clicked.connect(self.choose_default_credential)
+        self.credential_list = QListWidget()
+        self.credential_list.setMaximumHeight(140)
+        self._reload_credential_list()
+        add_credential = QPushButton("添加…")
+        remove_credential = QPushButton("移除")
+        add_credential.clicked.connect(self.add_default_credentials)
+        remove_credential.clicked.connect(self.remove_default_credential)
+        credential_buttons = QVBoxLayout()
+        credential_buttons.addWidget(add_credential)
+        credential_buttons.addWidget(remove_credential)
+        credential_buttons.addStretch()
         credential_row = QHBoxLayout()
-        credential_row.addWidget(self.default_credential, 1)
-        credential_row.addWidget(choose)
+        credential_row.addWidget(self.credential_list, 1)
+        credential_row.addLayout(credential_buttons)
+        credential_hint = QLabel("可添加多个 JSON。读取和写入会按顺序轮询，遇到 429 自动换下一个。请把表格共享给每一个服务账号邮箱。")
+        credential_hint.setObjectName("muted")
+        credential_hint.setWordWrap(True)
         form.addRow("全局排除 Sheet", self.global_excludes)
-        form.addRow("默认服务账号 JSON", credential_row)
+        form.addRow("服务账号 JSON", credential_row)
+        form.addRow("", credential_hint)
         save = QPushButton("保存设置")
         save.setObjectName("primary")
         save.clicked.connect(self.save_settings)
@@ -1061,7 +1074,7 @@ class MainWindow(QMainWindow):
             values = [
                 "是" if source.enabled else "否", source.name, source.url,
                 "、".join(source.include_sheets) or "全部", "、".join(source.exclude_sheets) or "—",
-                str(source.header_row), schema_label, "服务账号" if source.credential_path else "公开读取",
+                str(source.header_row), schema_label, self._source_auth_label(source),
             ]
             for column, value in enumerate(values):
                 self.source_table.setItem(row, column, QTableWidgetItem(value))
@@ -1077,8 +1090,6 @@ class MainWindow(QMainWindow):
         dialog = SourceDialog(self.store, parent=self)
         if dialog.exec():
             value = dialog.value()
-            if not value.credential_path:
-                value.credential_path = self.store.get("credential_path", "")
             self.store.save_source(value)
             self.refresh_sources()
 
@@ -2476,14 +2487,45 @@ class MainWindow(QMainWindow):
         task.failed.connect(failed)
         task.start()
 
-    def choose_default_credential(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "选择服务账号 JSON", "", "JSON 文件 (*.json)")
-        if path:
-            self.default_credential.setText(path)
+    def _source_auth_label(self, source: SourceConfig) -> str:
+        if source.credential_path.strip():
+            return "指定账号"
+        if self.store.list_credential_paths():
+            return "账号池轮询"
+        return "公开读取"
+
+    def _reload_credential_list(self) -> None:
+        if not hasattr(self, "credential_list"):
+            return
+        self.credential_list.clear()
+        for path in self.store.list_credential_paths():
+            item = QListWidgetItem(path)
+            item.setToolTip(path)
+            self.credential_list.addItem(item)
+
+    def add_default_credentials(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(self, "选择服务账号 JSON", "", "JSON 文件 (*.json)")
+        existing = {self.credential_list.item(index).text().casefold() for index in range(self.credential_list.count())}
+        for path in paths:
+            text = str(path).strip()
+            if not text.lower().endswith(".json") or text.casefold() in existing:
+                continue
+            item = QListWidgetItem(text)
+            item.setToolTip(text)
+            self.credential_list.addItem(item)
+            existing.add(text.casefold())
+
+    def remove_default_credential(self) -> None:
+        row = self.credential_list.currentRow()
+        if row >= 0:
+            self.credential_list.takeItem(row)
 
     def save_settings(self) -> None:
         self.store.set("global_excludes", split_names(self.global_excludes.toPlainText()))
-        self.store.set("credential_path", self.default_credential.text().strip())
+        self.store.set_credential_paths([
+            self.credential_list.item(index).text().strip()
+            for index in range(self.credential_list.count())
+        ])
         QMessageBox.information(self, "已保存", "设置已经保存。")
 
     def export_config_file(self) -> None:
@@ -2556,7 +2598,7 @@ class MainWindow(QMainWindow):
         try:
             if hasattr(self, "global_excludes"):
                 self.global_excludes.setPlainText("\n".join(self.store.get("global_excludes", [])))
-                self.default_credential.setText(str(self.store.get("credential_path", "") or ""))
+                self._reload_credential_list()
             if hasattr(self, "query_mode"):
                 saved_source = str(self.store.get("query_source", "extract") or "extract")
                 if saved_source in QUERY_SOURCES:

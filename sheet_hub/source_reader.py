@@ -36,6 +36,25 @@ def _google_download_host_ok(url: str) -> bool:
     return host.endswith(".google.com") or host.endswith(".googleusercontent.com")
 
 
+RETRY_STATUSES = {429, 500, 502, 503, 504}
+
+
+def normalize_credential_paths(*groups: Iterable[object]) -> list[str]:
+    result: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        if group is None:
+            continue
+        items = [group] if isinstance(group, str) else group
+        for item in items:
+            text = str(item or "").strip()
+            key = text.casefold()
+            if text and key not in seen:
+                seen.add(key)
+                result.append(text)
+    return result
+
+
 def google_retry(call, logger: LogFn | None = None, attempts: int = 7):
     """Retry Google API quota and transient server errors with bounded backoff."""
     log = logger or (lambda level, message: None)
@@ -45,11 +64,69 @@ def google_retry(call, logger: LogFn | None = None, attempts: int = 7):
         except Exception as exc:
             response = getattr(exc, "response", None)
             status = getattr(response, "status_code", None)
-            if status not in {429, 500, 502, 503, 504} or attempt == attempts - 1:
+            if status not in RETRY_STATUSES or attempt == attempts - 1:
                 raise
             wait_seconds = min(45.0, (2 ** attempt) + random.random())
             log("WARNING", f"Google API 暂时限流（{status}），{wait_seconds:.1f} 秒后自动重试 {attempt + 2}/{attempts}")
             time.sleep(wait_seconds)
+
+
+class CredentialPool:
+    """Round-robin Google service accounts; rotate immediately on 429/5xx."""
+
+    def __init__(
+        self,
+        paths: Iterable[str] | None,
+        logger: LogFn | None = None,
+        client_factory=None,
+        start: int = 0,
+    ):
+        self.paths = normalize_credential_paths(paths)
+        self.logger = logger or (lambda level, message: None)
+        self._factory = client_factory
+        self._clients: dict[str, object] = {}
+        self.index = int(start) % len(self.paths) if self.paths else 0
+
+    def _factory_fn(self):
+        return self._factory or SourceReader._gspread_client
+
+    def _client(self, path: str):
+        if path not in self._clients:
+            self._clients[path] = self._factory_fn()(path)
+        return self._clients[path]
+
+    def call(self, fn, attempts: int = 7):
+        if not self.paths:
+            raise FileNotFoundError("没有可用的服务账号 JSON")
+        last_exc: Exception | None = None
+        retries = max(int(attempts), len(self.paths))
+        for attempt in range(retries):
+            path = self.paths[self.index % len(self.paths)]
+            try:
+                result = fn(self._client(path))
+                self.index = (self.index + 1) % len(self.paths)
+                return result
+            except FileNotFoundError as exc:
+                last_exc = exc
+                self.logger("WARNING", f"服务账号无效，已跳过：{Path(path).name}")
+                self.index = (self.index + 1) % len(self.paths)
+                if attempt == retries - 1:
+                    raise
+            except Exception as exc:
+                last_exc = exc
+                status = getattr(getattr(exc, "response", None), "status_code", None)
+                if status in RETRY_STATUSES and attempt < retries - 1:
+                    self.logger("WARNING", f"服务账号 {Path(path).name} 返回 {status}，切换下一个")
+                    self.index = (self.index + 1) % len(self.paths)
+                    if (attempt + 1) % len(self.paths) == 0:
+                        wait_seconds = min(20.0, (1.6 ** (attempt // max(1, len(self.paths)))) + random.random())
+                        self.logger("WARNING", f"全部服务账号均限流，{wait_seconds:.1f} 秒后继续轮询")
+                        time.sleep(wait_seconds)
+                    continue
+                raise
+        if last_exc:
+            raise last_exc
+        raise RuntimeError("服务账号轮询失败")
 
 
 def spreadsheet_id(url: str) -> str:
@@ -180,11 +257,13 @@ class SourceReader:
         global_excludes: list[str],
         logger: LogFn | None = None,
         column_schema: list[str] | None = None,
+        credential_paths: list[str] | None = None,
     ):
         self.aliases = aliases
         self.global_excludes = global_excludes
         self.logger = logger or (lambda level, message: None)
         self.column_schema = list(column_schema or [])
+        self.credential_paths = normalize_credential_paths(credential_paths)
 
     def _headers(self, actual_values: list[object]) -> tuple[list[str], list[int] | None]:
         entries = normalize_column_schema(self.column_schema)
@@ -228,20 +307,20 @@ class SourceReader:
                     raise ValueError("本地 Excel 文件过大，已拒绝读取")
                 return self._read_workbook(source, content, path.stem)
             raise ValueError("无法识别 Google 表格链接或本地 Excel 文件")
-        credential = source.credential_path.strip()
-        if credential:
-            return self._read_private(source, sid, credential)
+        paths = normalize_credential_paths(source.credential_path, self.credential_paths)
+        if paths:
+            return self._read_private(source, sid, paths)
         return self._read_public(source, sid)
 
     def list_sheets(self, source: SourceConfig) -> list[str]:
         sid = spreadsheet_id(source.url)
-        if source.credential_path.strip():
-            client = self._gspread_client(source.credential_path)
-            metadata = google_retry(
-                lambda: client.http_client.fetch_sheet_metadata(
+        paths = normalize_credential_paths(source.credential_path, self.credential_paths)
+        if paths:
+            pool = CredentialPool(paths, self.logger)
+            metadata = pool.call(
+                lambda client: client.http_client.fetch_sheet_metadata(
                     sid, params={"fields": "sheets.properties.title"}
-                ),
-                self.logger,
+                )
             )
             return [item["properties"]["title"] for item in metadata.get("sheets", [])]
         content = self._download_public_xlsx(sid, timeout=60)
@@ -314,13 +393,12 @@ class SourceReader:
         workbook.close()
         return records
 
-    def _read_private(self, source: SourceConfig, sid: str, credential: str) -> list[Record]:
-        client = self._gspread_client(credential)
-        metadata = google_retry(
-            lambda: client.http_client.fetch_sheet_metadata(
+    def _read_private(self, source: SourceConfig, sid: str, credential: str | list[str]) -> list[Record]:
+        pool = CredentialPool(credential if isinstance(credential, list) else [credential], self.logger)
+        metadata = pool.call(
+            lambda client: client.http_client.fetch_sheet_metadata(
                 sid, params={"fields": "sheets.properties(title,hidden)"}
-            ),
-            self.logger,
+            )
         )
         all_names = [item["properties"]["title"] for item in metadata.get("sheets", [])]
         excludes = [*self.global_excludes, *source.exclude_sheets]
@@ -332,13 +410,12 @@ class SourceReader:
         for start in range(0, len(selected), 100):
             names = selected[start:start + 100]
             ranges = [f"'{name.replace(chr(39), chr(39) * 2)}'!A:ZZZ" for name in names]
-            response = google_retry(
-                lambda ranges=ranges: client.http_client.values_batch_get(
+            response = pool.call(
+                lambda client, ranges=ranges: client.http_client.values_batch_get(
                     sid,
                     ranges,
                     params={"majorDimension": "ROWS", "valueRenderOption": "FORMATTED_VALUE"},
-                ),
-                self.logger,
+                )
             )
             returned = response.get("valueRanges", [])
             for index, sheet_name in enumerate(names):

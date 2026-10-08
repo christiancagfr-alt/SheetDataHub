@@ -8,7 +8,7 @@
 python app.py
 ```
 
-公开表格无需凭据（需要开启“知道链接的任何人可查看”）。私有表格需要在设置页选择 Google 服务账号 JSON，并将目标表格共享给该服务账号邮箱。
+公开表格无需凭据（需要开启“知道链接的任何人可查看”）。私有表格在设置页添加一个或多个 Google 服务账号 JSON，并把目标表格共享给每一个服务账号邮箱。多个账号会按顺序轮询，遇到 429 自动切换。
 
 时间提取支持输出到本地 Excel 或指定 Google 表格链接/子工作表。Google 私有表格读取会把多个子 Sheet 合并为批量请求；遇到 429、5xx 时自动指数退避重试。
 
@@ -41,9 +41,10 @@ python app.py
 
 | 文件 | 说明 |
 |------|------|
-| `SheetDataHub-Setup.exe` | Windows 安装程序（推荐） |
-| `SheetDataHub-windows.zip` | Windows 免安装便携包，解压后运行 `SheetDataHub/SheetDataHub.exe` |
-| `SheetDataHub-macos-arm64.zip` | macOS Apple Silicon 包，解压后打开 `SheetDataHub.app` |
+| `SheetDataHub-Setup-v1.4.0.exe` | Windows 安装程序（推荐） |
+| `SheetDataHub-windows-v1.4.0.zip` | Windows 免安装便携包，解压后运行 `SheetDataHub/SheetDataHub.exe` |
+| `SheetDataHub-macos-arm64-v1.4.0.dmg` | macOS 安装盘：打开后把 `SheetDataHub.app` 拖进「应用程序」 |
+| `SheetDataHub-macos-arm64-v1.4.0.zip` | macOS 便携包 |
 
 系统要求：Windows 10 / 11（64 位），或 macOS 12+（Apple Silicon）。Mac 若提示无法打开，按住 Control 单击图标再选打开。
 
@@ -52,9 +53,9 @@ python app.py
 下载后，使用 GitHub CLI 验证文件确实由官方 CI 构建、且未被篡改：
 
 ```bash
-gh attestation verify ./SheetDataHub-windows.zip --repo christiancagfr-alt/SheetDataHub
-gh attestation verify ./SheetDataHub-Setup.exe --repo christiancagfr-alt/SheetDataHub
-gh attestation verify ./SheetDataHub-macos-arm64.zip --repo christiancagfr-alt/SheetDataHub
+gh attestation verify ./SheetDataHub-windows-v1.4.0.zip --repo christiancagfr-alt/SheetDataHub
+gh attestation verify ./SheetDataHub-Setup-v1.4.0.exe --repo christiancagfr-alt/SheetDataHub
+gh attestation verify ./SheetDataHub-macos-arm64-v1.4.0.dmg --repo christiancagfr-alt/SheetDataHub
 ```
 
 验证成功表示该软件确实由官方 GitHub Actions 构建。

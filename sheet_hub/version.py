@@ -7,7 +7,7 @@ from typing import Any
 import requests
 
 
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 UPDATE_REPO = "christiancagfr-alt/SheetDataHub"
 RELEASES_URL = f"https://github.com/{UPDATE_REPO}/releases"
 INSTALLER_URL_PREFIXES = (
@@ -35,6 +35,19 @@ def is_newer(latest: str, current: str = APP_VERSION) -> bool:
     return left + (0,) * (width - len(left)) > right + (0,) * (width - len(right))
 
 
+def pick_windows_installer(assets: list[dict[str, Any]]) -> dict[str, Any] | None:
+    ranked: list[tuple[int, dict[str, Any]]] = []
+    for asset in assets:
+        name = str(asset.get("name") or "").casefold()
+        if not name.endswith(".exe") or "sheetdatahub" not in name or "setup" not in name:
+            continue
+        ranked.append((0 if re.search(r"-v\d", name) else 1, asset))
+    if not ranked:
+        return None
+    ranked.sort(key=lambda item: item[0])
+    return ranked[0][1]
+
+
 def installer_url_allowed(url: str) -> bool:
     text = str(url or "").strip()
     if not text.startswith("https://"):
@@ -58,13 +71,7 @@ def fetch_latest_release(timeout: int = 20) -> dict[str, Any]:
     tag = str(data.get("tag_name") or "").strip()
     version = tag.lstrip("vV") or APP_VERSION
     assets = list(data.get("assets") or [])
-    installer = next(
-        (
-            asset for asset in assets
-            if str(asset.get("name") or "").casefold() == "sheetdatahub-setup.exe"
-        ),
-        None,
-    )
+    installer = pick_windows_installer(assets)
     installer_url = str((installer or {}).get("browser_download_url") or "")
     if installer_url and not installer_url_allowed(installer_url):
         installer_url = ""
