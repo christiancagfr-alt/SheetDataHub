@@ -8,8 +8,8 @@ import uuid
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QDate, QPoint, QPointF, QRect, QThread, QTimer, QUrl, Qt, Signal
-from PySide6.QtGui import QColor, QDesktopServices, QFont, QFontDatabase, QFontMetrics, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtCore import QDate, QPoint, QPointF, QRect, QThread, QTimer, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QFontMetrics, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -54,7 +54,7 @@ from .source_reader import (
     schema_field_names,
     split_names,
 )
-from .version import APP_VERSION, RELEASES_URL, download_release_installer, fetch_latest_release, is_newer
+from .version import APP_VERSION, download_release_installer, fetch_latest_release, is_newer
 
 
 APP_TITLE = "表数通"
@@ -114,7 +114,7 @@ class ColumnMapRow(QFrame):
         self.enabled_box = QCheckBox()
         self.enabled_box.setChecked(enabled)
         self.name_edit = QLineEdit(name)
-        self.name_edit.setPlaceholderText("表头名称，例如：贴文ID")
+        self.name_edit.setPlaceholderText("表头名称")
         self.column_box = QComboBox()
         self.column_box.setEditable(True)
         self.column_box.setInsertPolicy(QComboBox.NoInsert)
@@ -611,7 +611,7 @@ class MainWindow(QMainWindow):
     def _analysis_page(self) -> QWidget:
         page, layout = self._page(
             "数据分析",
-            "查询和分析走本地库。同步会下载表格最新数据并替换本地库。场记只数含 D 的条数。",
+            "查询和分析走本地库。同步会下载表格最新数据并替换本地库。含「场」的列只数单元格里的 D。",
         )
         self._analysis_result = None
         self._analysis_chart_headers: list[str] = []
@@ -742,7 +742,7 @@ class MainWindow(QMainWindow):
         stats.addWidget(self.analysis_stat_current)
         stats.addWidget(self.analysis_stat_previous)
 
-        self.analysis_summary = QLabel("选数据源后开始分析。勾选加友途径等表头，曲线会按渠道分开。")
+        self.analysis_summary = QLabel("选数据源后开始分析。勾选分类列时，曲线会按该列的不同取值分开。")
         self.analysis_summary.setObjectName("muted")
         self.analysis_summary.setWordWrap(True)
 
@@ -950,7 +950,7 @@ class MainWindow(QMainWindow):
         schema_actions = QHBoxLayout()
         self.schema_enabled = QCheckBox("启用全局字段分配")
         self.schema_enabled.setChecked(bool(self.store.get("column_schema_enabled", False)))
-        example = QPushButton("填入示例")
+        example = QPushButton("填入常用字段")
         example.clicked.connect(self.fill_example_schema)
         schema_actions.addWidget(self.schema_enabled)
         schema_actions.addWidget(example)
@@ -1768,7 +1768,7 @@ class MainWindow(QMainWindow):
         if selected:
             title = "每日 · " + "、".join(selected)
             if session_selected:
-                title += "（场记=含D条数）"
+                title += "（含D条数）"
         self.analysis_chart.set_series(series, title)
         if session_selected:
             slices = []
@@ -1779,7 +1779,7 @@ class MainWindow(QMainWindow):
                 count = float(item.series[0].count)
                 if count > 0:
                     slices.append((header, count, PIE_COLORS[index % len(PIE_COLORS)]))
-            pie_title = "本期各场含D数量"
+            pie_title = "本期含D数量"
         else:
             pie_header = selected[0] if selected else ""
             pie_item = breakdowns.get(pie_header) if pie_header else None
@@ -1877,7 +1877,7 @@ class MainWindow(QMainWindow):
         dialog.setWindowTitle("选择曲线显示的数据")
         dialog.resize(360, 420)
         box = QVBoxLayout(dialog)
-        hint = QLabel("勾选后按该列的不同取值各画一条线。加友途径按渠道分开；场记（第一场、第二场等）只数含 D 的条数，不是时长。")
+        hint = QLabel("勾选后按该列的不同取值各画一条线。含「场」的列只数单元格里的 D，不按时长累计。")
         hint.setObjectName("muted")
         hint.setWordWrap(True)
         box.addWidget(hint)
@@ -2306,7 +2306,7 @@ class MainWindow(QMainWindow):
         self.schema_editor.setEnabled(enabled)
 
     def fill_example_schema(self) -> None:
-        names = ["专页ID", "姓名", "标签", "订阅时间", "性别", "评论贴文", "手机号码", "日期"]
+        names = ["日期", "姓名", "队别", "状态", "分类", "数量", "备注"]
         self.schema_enabled.setChecked(True)
         self.schema_editor.set_schema([
             {"name": name, "column": excel_column(index), "enabled": True}
@@ -2388,7 +2388,7 @@ class MainWindow(QMainWindow):
                 return
             if is_newer(str(info.get("version") or ""), APP_VERSION):
                 self.statusBar().showMessage(
-                    f"发现新版本 v{info['version']}，可点击「检查并安装更新」直接安装",
+                    f"发现新版本 v{info['version']}，点击「检查并安装更新」会直接下载并安装",
                     20000,
                 )
 
@@ -2432,33 +2432,26 @@ class MainWindow(QMainWindow):
         task.start()
 
     def show_update_result(self, info: dict[str, str]) -> None:
-        self._set_update_buttons_enabled(True)
         latest = str(info.get("version") or "")
-        if is_newer(latest, APP_VERSION):
-            box = QMessageBox(self)
-            box.setWindowTitle("发现新版本")
-            box.setText(f"当前版本：v{APP_VERSION}\n最新版本：v{latest}")
-            can_install = sys.platform == "win32" and bool(info.get("installer_url"))
-            if can_install:
-                box.setInformativeText("软件将自动下载安装包，随后关闭当前版本并启动安装。")
-                install_button = box.addButton("立即下载安装", QMessageBox.AcceptRole)
-                box.addButton("稍后", QMessageBox.RejectRole)
-                box.exec()
-                if box.clickedButton() is install_button:
-                    self.download_and_install_update(info)
-                return
-            box.setInformativeText("请到 GitHub Releases 下载当前系统对应的安装包。")
-            open_button = box.addButton("打开下载页", QMessageBox.AcceptRole)
-            box.addButton("稍后", QMessageBox.RejectRole)
-            box.exec()
-            if box.clickedButton() is open_button:
-                QDesktopServices.openUrl(QUrl(str(info.get("url") or RELEASES_URL)))
+        if not is_newer(latest, APP_VERSION):
+            self.statusBar().showMessage(f"当前已经是最新版本 v{APP_VERSION}", 8000)
+            QMessageBox.information(self, "已是最新", f"当前已经是最新版本 v{APP_VERSION}。")
             return
-        QMessageBox.information(self, "已是最新", f"当前已经是最新版本 v{APP_VERSION}。")
+        if not info.get("installer_url"):
+            self.statusBar().showMessage(f"发现新版本 v{latest}，但没有当前系统的安装包", 8000)
+            QMessageBox.warning(
+                self,
+                "发现新版本",
+                f"当前版本：v{APP_VERSION}\n最新版本：v{latest}\n\n没有找到当前系统的安装包，请稍后再试。",
+            )
+            return
+        self.statusBar().showMessage(f"发现新版本 v{latest}，正在下载并安装…")
+        self.download_and_install_update(info)
 
     def download_and_install_update(self, info: dict[str, str]) -> None:
         self._set_update_buttons_enabled(False)
-        self.statusBar().showMessage("正在下载安装包，请稍候…")
+        latest = str(info.get("version") or "")
+        self.statusBar().showMessage(f"正在下载 v{latest} 安装包，请稍候…")
         task = TaskThread(lambda: download_release_installer(info, self.store.data_dir), self)
         self.tasks.append(task)
 
@@ -2471,9 +2464,26 @@ class MainWindow(QMainWindow):
             if installer.parent != updates:
                 QMessageBox.critical(self, "更新失败", "安装包路径不在本机更新目录，已拒绝启动。")
                 return
-            QMessageBox.information(self, "下载完成", "安装包已下载，将关闭当前软件并启动安装程序。")
-            subprocess.Popen([str(installer)], cwd=str(installer.parent))
-            QApplication.quit()
+            suffix = installer.suffix.casefold()
+            if suffix == ".exe":
+                QMessageBox.information(self, "下载完成", "安装包已下载，将关闭当前软件并启动安装程序。")
+                subprocess.Popen([str(installer)], cwd=str(installer.parent))
+                QApplication.quit()
+                return
+            if suffix == ".dmg":
+                subprocess.Popen(["open", str(installer)], cwd=str(installer.parent))
+                self.statusBar().showMessage("安装盘已打开", 8000)
+                QMessageBox.information(
+                    self,
+                    "下载完成",
+                    "安装盘已打开。请把应用拖到「应用程序」文件夹，然后重新打开软件。",
+                )
+                return
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", str(installer)], cwd=str(installer.parent))
+            else:
+                subprocess.Popen([str(installer)], cwd=str(installer.parent))
+            QMessageBox.information(self, "下载完成", "安装包已下载并打开。")
 
         def failed(message: str) -> None:
             self._set_update_buttons_enabled(True)

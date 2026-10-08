@@ -12,16 +12,18 @@ python app.py
 
 时间提取支持输出到本地 Excel 或指定 Google 表格链接/子工作表。Google 私有表格读取会把多个子 Sheet 合并为批量请求；遇到 429、5xx 时自动指数退避重试。
 
-查询结果只显示输入电话、专页 ID、姓名、评论贴文、号码、日期和修正格式，并可一键复制“号码 + 修正格式”两列。时间提取写入已有 Google 子工作表时，会按字段别名识别“姓名/名字”“手机号码/号码”等同义表头，并遵循目标工作表现有列顺序。
+查询结果按当前表的表头显示。识别为号码数据表时，会提供修正格式，并可复制号码列。时间提取写入已有 Google 子工作表时，会按字段别名识别同义表头，并遵循目标工作表现有列顺序。
+
+应用内「检查并安装更新」会直接下载当前系统的安装包并启动安装，不会打开网页。
 
 ## 数据分析
 
-侧栏「数据分析」使用你在「数据源」里已经配置好的表格。队别从表头自动匹配；日期列、名字列可在下拉里切换（同一张表有多列时，例如「交教会日期 / 见证日期」「摸底/推广 / 线索名字」）。
+侧栏「数据分析」使用你在「数据源」里已经配置好的表格。日期列、名字列可在下拉里切换。
 
 - 队别不选 = 全部队别；名字留空 = 该队全员。两者可单独筛选。
 - 默认时间是当月、不对比。可选最近 7 天、最近 2 天或自定义；勾选「对比」后才显示对比期。
-- 曲线上方用小方框勾选要画的数据；太多时点「更多」。勾选「加友途径」会按渠道各画一条线，不是一个总数。
-- 场记（第一场、第二场等）只统计单元格里含 D 的条数，不按时长拆线、也不累计分钟。
+- 曲线上方用小方框勾选要画的列；太多时点「更多」。勾选分类列会按不同取值各画一条线。
+- 名称含「场」的列只统计单元格里含 D 的条数，不按时长拆线、也不累计分钟。
 - 鼠标移到曲线节点或饼图扇区上，会悬浮显示准确数字。
 - 每日表在对比开启时同时列出本期和对比期；增减绿色为升、红色为降。
 - 图表可切换曲线或饼图。饼图扇区上显示百分比，并用线连到名称。
@@ -41,10 +43,10 @@ python app.py
 
 | 文件 | 说明 |
 |------|------|
-| `SheetDataHub-Setup-v1.4.0.exe` | Windows 安装程序（推荐） |
-| `SheetDataHub-windows-v1.4.0.zip` | Windows 免安装便携包，解压后运行 `SheetDataHub/SheetDataHub.exe` |
-| `SheetDataHub-macos-arm64-v1.4.0.dmg` | macOS 安装盘：打开后把 `SheetDataHub.app` 拖进「应用程序」 |
-| `SheetDataHub-macos-arm64-v1.4.0.zip` | macOS 便携包 |
+| `SheetDataHub-Setup-v1.4.1.exe` | Windows 安装程序（推荐） |
+| `SheetDataHub-windows-v1.4.1.zip` | Windows 免安装便携包，解压后运行 `SheetDataHub/SheetDataHub.exe` |
+| `SheetDataHub-macos-arm64-v1.4.1.dmg` | macOS 安装盘：打开后把 `SheetDataHub.app` 拖进「应用程序」 |
+| `SheetDataHub-macos-arm64-v1.4.1.zip` | macOS 便携包 |
 
 系统要求：Windows 10 / 11（64 位），或 macOS 12+（Apple Silicon）。Mac 若提示无法打开，按住 Control 单击图标再选打开。
 
@@ -53,9 +55,9 @@ python app.py
 下载后，使用 GitHub CLI 验证文件确实由官方 CI 构建、且未被篡改：
 
 ```bash
-gh attestation verify ./SheetDataHub-windows-v1.4.0.zip --repo christiancagfr-alt/SheetDataHub
-gh attestation verify ./SheetDataHub-Setup-v1.4.0.exe --repo christiancagfr-alt/SheetDataHub
-gh attestation verify ./SheetDataHub-macos-arm64-v1.4.0.dmg --repo christiancagfr-alt/SheetDataHub
+gh attestation verify ./SheetDataHub-windows-v1.4.1.zip --repo christiancagfr-alt/SheetDataHub
+gh attestation verify ./SheetDataHub-Setup-v1.4.1.exe --repo christiancagfr-alt/SheetDataHub
+gh attestation verify ./SheetDataHub-macos-arm64-v1.4.1.dmg --repo christiancagfr-alt/SheetDataHub
 ```
 
 验证成功表示该软件确实由官方 GitHub Actions 构建。
@@ -78,7 +80,7 @@ chmod +x build_macos.sh
 ## 如何发布新版本
 
 发布仓库：https://github.com/christiancagfr-alt/SheetDataHub  
-应用内「检查更新」读取该仓库的 GitHub Releases。
+应用内「检查并安装更新」读取该仓库的 GitHub Releases，并直接下载安装。
 
 本项目使用 GitHub Actions 自动构建 Windows 与 macOS 包。每次发布新版本只需要创建一个 Git Tag 并推送到个人仓库。
 
@@ -130,7 +132,7 @@ git push origin v1.0.1
 
 ### 版本号说明
 
-| 版本号格式 | 什么时候用 | 示例 |
+| 版本号格式 | 什么时候用 | 对应形式 |
 |-----------|-----------|------|
 | `vX.0.0` | 重大更新、不兼容改动 | `v2.0.0` |
 | `vX.Y.0` | 新增功能 | `v1.1.0` |

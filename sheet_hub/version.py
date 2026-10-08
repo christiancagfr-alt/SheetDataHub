@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import re
+import sys
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import requests
 
 
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.4.1"
 UPDATE_REPO = "christiancagfr-alt/SheetDataHub"
 RELEASES_URL = f"https://github.com/{UPDATE_REPO}/releases"
 INSTALLER_URL_PREFIXES = (
@@ -16,6 +18,7 @@ INSTALLER_URL_PREFIXES = (
     "https://release-assets.githubusercontent.com/",
     "https://github-releases.githubusercontent.com/",
 )
+MIN_INSTALLER_BYTES = 1024 * 1024
 
 
 def parse_version(text: str) -> tuple[int, ...]:
@@ -35,17 +38,98 @@ def is_newer(latest: str, current: str = APP_VERSION) -> bool:
     return left + (0,) * (width - len(left)) > right + (0,) * (width - len(right))
 
 
-def pick_windows_installer(assets: list[dict[str, Any]]) -> dict[str, Any] | None:
+def _asset_filename(asset: dict[str, Any]) -> str:
+    name = str(asset.get("name") or "").strip()
+    if name:
+        return name
+    path = urlparse(str(asset.get("browser_download_url") or "")).path
+    return Path(path).name
+
+
+def _rank_asset(asset: dict[str, Any], prefer_tokens: tuple[str, ...] = ()) -> tuple[int, dict[str, Any]]:
+    name = _asset_filename(asset).casefold()
+    score = 0 if re.search(r"-v\d", name) else 10
+    for index, token in enumerate(prefer_tokens):
+        if token and token not in name:
+            score += 20 + index
+    return (score, asset)
+
+
+def pick_named_asset(
+    assets: list[dict[str, Any]],
+    *,
+    suffixes: tuple[str, ...],
+    required_tokens: tuple[str, ...],
+    prefer_tokens: tuple[str, ...] = (),
+) -> dict[str, Any] | None:
     ranked: list[tuple[int, dict[str, Any]]] = []
     for asset in assets:
-        name = str(asset.get("name") or "").casefold()
-        if not name.endswith(".exe") or "sheetdatahub" not in name or "setup" not in name:
+        name = _asset_filename(asset).casefold()
+        if not any(name.endswith(suffix) for suffix in suffixes):
             continue
-        ranked.append((0 if re.search(r"-v\d", name) else 1, asset))
+        if any(token not in name for token in required_tokens):
+            continue
+        ranked.append(_rank_asset(asset, prefer_tokens))
     if not ranked:
         return None
     ranked.sort(key=lambda item: item[0])
     return ranked[0][1]
+
+
+def pick_windows_installer(assets: list[dict[str, Any]]) -> dict[str, Any] | None:
+    return pick_named_asset(
+        assets,
+        suffixes=(".exe",),
+        required_tokens=("sheetdatahub", "setup"),
+    )
+
+
+def pick_macos_installer(assets: list[dict[str, Any]]) -> dict[str, Any] | None:
+    machine = _macos_machine().casefold()
+    prefer = ("arm64",) if ("arm" in machine or "aarch" in machine) else ("x86_64", "intel", "amd64")
+    dmg = pick_named_asset(
+        assets,
+        suffixes=(".dmg",),
+        required_tokens=("sheetdatahub",),
+        prefer_tokens=prefer,
+    )
+    if dmg:
+        return dmg
+    return pick_named_asset(
+        assets,
+        suffixes=(".zip",),
+        required_tokens=("sheetdatahub", "macos"),
+        prefer_tokens=prefer,
+    )
+
+
+def _macos_machine() -> str:
+    try:
+        import platform
+        return str(platform.machine() or "")
+    except Exception:
+        return ""
+
+
+def pick_current_installer(assets: list[dict[str, Any]], platform_name: str | None = None) -> dict[str, Any] | None:
+    platform_name = (platform_name or sys.platform).casefold()
+    if platform_name.startswith("win"):
+        return pick_windows_installer(assets)
+    if platform_name == "darwin":
+        return pick_macos_installer(assets)
+    return None
+
+
+def installer_kind(name: str, url: str = "") -> str:
+    filename = str(name or "").strip() or Path(urlparse(url).path).name
+    folded = filename.casefold()
+    if folded.endswith(".exe"):
+        return "exe"
+    if folded.endswith(".dmg"):
+        return "dmg"
+    if folded.endswith(".zip"):
+        return "zip"
+    return ""
 
 
 def installer_url_allowed(url: str) -> bool:
@@ -71,18 +155,45 @@ def fetch_latest_release(timeout: int = 20) -> dict[str, Any]:
     tag = str(data.get("tag_name") or "").strip()
     version = tag.lstrip("vV") or APP_VERSION
     assets = list(data.get("assets") or [])
-    installer = pick_windows_installer(assets)
+    installer = pick_current_installer(assets)
+    installer_name = _asset_filename(installer or {})
     installer_url = str((installer or {}).get("browser_download_url") or "")
+    kind = installer_kind(installer_name, installer_url)
     if installer_url and not installer_url_allowed(installer_url):
         installer_url = ""
+        kind = ""
     return {
         "tag": tag or f"v{version}",
         "version": version,
         "url": str(data.get("html_url") or RELEASES_URL),
         "name": str(data.get("name") or tag or version),
         "installer_url": installer_url,
+        "installer_name": installer_name,
+        "installer_kind": kind,
         "installer_size": int((installer or {}).get("size") or 0),
     }
+
+
+def _validate_downloaded_installer(path: Path, kind: str) -> None:
+    if kind == "exe":
+        with path.open("rb") as source:
+            if source.read(2) != b"MZ":
+                raise RuntimeError("下载内容不是有效的 Windows 安装程序。")
+        return
+    if kind == "zip":
+        with path.open("rb") as source:
+            if source.read(2) != b"PK":
+                raise RuntimeError("下载内容不是有效的压缩包。")
+        return
+    if kind == "dmg":
+        size = path.stat().st_size
+        with path.open("rb") as source:
+            source.seek(max(0, size - 512))
+            tail = source.read(512)
+        if b"koly" not in tail:
+            raise RuntimeError("下载内容不是有效的 macOS 安装盘。")
+        return
+    raise RuntimeError("该版本没有当前系统可用的安装包。")
 
 
 def download_release_installer(
@@ -92,14 +203,17 @@ def download_release_installer(
 ) -> Path:
     url = str(info.get("installer_url") or "").strip()
     if not url:
-        raise RuntimeError("该版本没有可用的 Windows 安装包，请稍后再试。")
+        raise RuntimeError("该版本没有当前系统可用的安装包，请稍后再试。")
     if not installer_url_allowed(url):
         raise RuntimeError("安装包地址不是 GitHub 官方下载链接，已拒绝。")
     version = re.sub(r"[^0-9A-Za-z._-]", "_", str(info.get("version") or "latest"))
+    kind = installer_kind(str(info.get("installer_name") or ""), url)
+    if kind not in {"exe", "dmg", "zip"}:
+        raise RuntimeError("该版本没有当前系统可用的安装包，请稍后再试。")
     update_dir = Path(data_dir) / "updates"
     update_dir.mkdir(parents=True, exist_ok=True)
-    destination = update_dir / f"SheetDataHub-Setup-v{version}.exe"
-    partial = destination.with_suffix(".exe.part")
+    destination = update_dir / f"SheetDataHub-update-v{version}.{kind}"
+    partial = destination.with_suffix(destination.suffix + ".part")
     expected_size = int(info.get("installer_size") or 0)
     try:
         with requests.get(
@@ -120,11 +234,9 @@ def download_release_installer(
                         written += len(chunk)
         if expected_size and written != expected_size:
             raise RuntimeError(f"安装包下载不完整：应为 {expected_size} 字节，实际 {written} 字节。")
-        if written < 1024 * 1024:
+        if written < MIN_INSTALLER_BYTES:
             raise RuntimeError("下载到的安装包大小异常。")
-        with partial.open("rb") as source:
-            if source.read(2) != b"MZ":
-                raise RuntimeError("下载内容不是有效的 Windows 安装程序。")
+        _validate_downloaded_installer(partial, kind)
         partial.replace(destination)
         return destination
     except Exception:

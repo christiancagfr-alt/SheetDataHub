@@ -602,8 +602,8 @@ class DataEngine:
             for stored, value in mapping.items()
             if any(hint in stored for hint in hints)
         ]
-        # Only infer a custom field when it is unambiguous. This supports names
-        # such as “交教会日期” and “线索电话号码” without guessing between two dates.
+        # Only infer a custom field when it is unambiguous, so two date-like
+        # headers are not collapsed into one guess.
         if len(semantic_matches) == 1:
             return semantic_matches[0]
         return ""

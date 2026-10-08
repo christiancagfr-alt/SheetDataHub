@@ -47,6 +47,9 @@ from sheet_hub.version import (
     installer_url_allowed,
     is_newer,
     parse_version,
+    pick_current_installer,
+    pick_macos_installer,
+    pick_windows_installer,
 )
 
 
@@ -148,6 +151,58 @@ class RuleTests(unittest.TestCase):
         ):
             with self.assertRaises(RuntimeError):
                 download_release_installer(info, directory)
+        self.assertEqual(info["installer_kind"], "exe")
+        self.assertTrue(str(path).endswith(".exe"))
+
+    def test_update_release_picks_macos_dmg(self):
+        assets = [
+            {
+                "name": "SheetDataHub-Setup-v9.9.9.exe",
+                "browser_download_url": "https://github.com/christiancagfr-alt/SheetDataHub/releases/download/v9.9.9/SheetDataHub-Setup-v9.9.9.exe",
+            },
+            {
+                "name": "SheetDataHub-macos-arm64-v9.9.9.dmg",
+                "browser_download_url": "https://github.com/christiancagfr-alt/SheetDataHub/releases/download/v9.9.9/SheetDataHub-macos-arm64-v9.9.9.dmg",
+                "size": 1024 * 1024 + 4,
+            },
+            {
+                "name": "SheetDataHub-macos-arm64-v9.9.9.zip",
+                "browser_download_url": "https://github.com/christiancagfr-alt/SheetDataHub/releases/download/v9.9.9/SheetDataHub-macos-arm64-v9.9.9.zip",
+            },
+        ]
+        self.assertEqual(pick_windows_installer(assets)["name"], "SheetDataHub-Setup-v9.9.9.exe")
+        self.assertEqual(pick_macos_installer(assets)["name"], "SheetDataHub-macos-arm64-v9.9.9.dmg")
+        self.assertEqual(pick_current_installer(assets, "win32")["name"], "SheetDataHub-Setup-v9.9.9.exe")
+        self.assertEqual(pick_current_installer(assets, "darwin")["name"], "SheetDataHub-macos-arm64-v9.9.9.dmg")
+        payload = (b"x" * (1024 * 1024)) + b"koly"
+        info = {
+            "version": "9.9.9",
+            "installer_url": assets[1]["browser_download_url"],
+            "installer_name": assets[1]["name"],
+            "installer_size": len(payload),
+        }
+
+        class FakeDownloadResponse:
+            url = info["installer_url"]
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+            def raise_for_status(self):
+                return None
+
+            def iter_content(self, chunk_size):
+                yield payload
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "sheet_hub.version.requests.get", return_value=FakeDownloadResponse()
+        ):
+            path = download_release_installer(info, directory)
+            self.assertTrue(str(path).endswith(".dmg"))
+            self.assertTrue(path.read_bytes().endswith(b"koly"))
 
     def test_credential_pool_rotates_on_429(self):
         class QuotaError(Exception):
@@ -200,9 +255,9 @@ class RuleTests(unittest.TestCase):
         self.assertEqual(calls["count"], 2)
 
     def test_phone_matching_normalizes_common_formats(self):
-        self.assertEqual(DataEngine._match_value("号码", "258-851-758692"), "258851758692")
-        self.assertEqual(DataEngine._match_value("号码", "258851758692.0"), "258851758692")
-        self.assertEqual(DataEngine._match_value("号码", "2.58851758692E+11"), "258851758692")
+        self.assertEqual(DataEngine._match_value("号码", "138-000-00000"), "13800000000")
+        self.assertEqual(DataEngine._match_value("号码", "13800000000.0"), "13800000000")
+        self.assertEqual(DataEngine._match_value("号码", "1.3800000000E+10"), "13800000000")
 
     def test_existing_aliases_are_migrated(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -230,21 +285,21 @@ class RuleTests(unittest.TestCase):
     def test_query_result_headers_keep_phone_format(self):
         with tempfile.TemporaryDirectory() as directory:
             store = ConfigStore(directory)
-            source_headers = ["预交表汇总", "见证状态", "交教会日期", "摸底/推广", "线索电话号码"]
+            source_headers = ["汇总列", "办理状态", "报名日期", "姓名", "联系电话"]
             self.assertEqual(
-                query_result_headers(store, "direct", "线索电话号码", source_headers, "交教会"),
+                query_result_headers(store, "direct", "联系电话", source_headers, "数据源A"),
                 source_headers,
             )
             self.assertEqual(
-                query_result_headers(store, "direct", "摸底/推广", source_headers, "交教会"),
+                query_result_headers(store, "direct", "姓名", source_headers, "数据源A"),
                 source_headers,
             )
             self.assertEqual(
                 query_result_headers(store, "direct", "号码", ["专页ID", "姓名", "号码"], "号码表"),
                 DEFAULT_QUERY_RESULT_FIELDS,
             )
-            self.assertFalse(is_phone_data_table(source_headers, "交教会"))
-            self.assertTrue(is_phone_data_table(["专页ID", "号码"], "交教会"))
+            self.assertFalse(is_phone_data_table(source_headers, "数据源A"))
+            self.assertTrue(is_phone_data_table(["专页ID", "号码"], "数据源A"))
 
     def test_source_cache_and_selected_sync(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -253,24 +308,24 @@ class RuleTests(unittest.TestCase):
             path = root / "club.xlsx"
             book = openpyxl.Workbook()
             book.active.title = "数据"
-            book.active.append(["加友途径4", "贴文ID"])
-            book.active.append(["2081专页后台", "p1"])
+            book.active.append(["渠道", "条目ID"])
+            book.active.append(["channel-1", "p1"])
             book.save(path)
             store.save_source(SourceConfig(
-                "club", "交教会", str(path),
+                "club", "数据源A", str(path),
                 column_schema_enabled=True,
                 column_schema=[
-                    {"name": "加友途径4", "column": "A", "enabled": True},
-                    {"name": "贴文ID", "column": "B", "enabled": True},
+                    {"name": "渠道", "column": "A", "enabled": True},
+                    {"name": "条目ID", "column": "B", "enabled": True},
                 ],
             ))
             engine = DataEngine(store)
             synced = engine.sync(["club"], write_local_db=True)
             self.assertEqual(synced["sources"], 1)
             self.assertTrue(engine.cache.has("club"))
-            self.assertEqual(engine.list_query_fields("direct", source_id="club"), ["加友途径4", "贴文ID"])
-            found = engine.query("加友途径4", "2081专页后台", source="direct", source_id="club")
-            self.assertEqual(found[0].values["贴文ID"], "p1")
+            self.assertEqual(engine.list_query_fields("direct", source_id="club"), ["渠道", "条目ID"])
+            found = engine.query("渠道", "channel-1", source="direct", source_id="club")
+            self.assertEqual(found[0].values["条目ID"], "p1")
 
 
 class DatabaseTests(unittest.TestCase):
@@ -362,10 +417,10 @@ class DatabaseTests(unittest.TestCase):
             store = ConfigStore(Path(directory) / "config")
             engine = DataEngine(store)
             engine.database.replace_all([
-                Record("s", "源", "g", "1008-李薇", 2, {"号码": "123", "名字": "李薇", "日期": "2026-09-13"}, "h1")
+                Record("s", "源", "g", "1008-PersonX", 2, {"号码": "123", "名字": "PersonX", "日期": "2026-09-13"}, "h1")
             ])
             results = engine.query_many("号码", ["123", "999"])
-            self.assertEqual(results[0][1].sheet_name, "1008-李薇")
+            self.assertEqual(results[0][1].sheet_name, "1008-PersonX")
             self.assertIsNone(results[1][1])
 
     def test_query_excludes_multiple_keywords(self):
@@ -429,11 +484,11 @@ class DatabaseTests(unittest.TestCase):
             return Record("s", "源", "g", name, row, {"名字": name, "日期": day, "业绩": score, "备注": note}, f"h{row}")
 
         return [
-            rec(2, "张三", "2026-10-05", "10"),
-            rec(3, "张三", "2026-10-06", "20"),
-            rec(4, "李四", "2026-10-05", "5"),
-            rec(5, "李四", "2026-10-06", "5"),
-            rec(6, "张三", "2026-09-28", "8"),
+            rec(2, "Alpha", "2026-10-05", "10"),
+            rec(3, "Alpha", "2026-10-06", "20"),
+            rec(4, "Beta", "2026-10-05", "5"),
+            rec(5, "Beta", "2026-10-06", "5"),
+            rec(6, "Alpha", "2026-09-28", "8"),
             rec(7, "广告号", "2026-10-06", "100", "广告推广"),
         ]
 
@@ -459,11 +514,11 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(result.previous.total, 8)
         self.assertEqual(result.delta_total, 32)
         people = {item.name: item for item in result.people}
-        self.assertEqual(people["张三"].total, 30)
-        self.assertEqual(people["张三"].count, 2)
-        self.assertEqual(people["张三"].previous_count, 1)
-        self.assertEqual(people["李四"].total, 10)
-        self.assertEqual(people["李四"].previous_count, 0)
+        self.assertEqual(people["Alpha"].total, 30)
+        self.assertEqual(people["Alpha"].count, 2)
+        self.assertEqual(people["Alpha"].previous_count, 1)
+        self.assertEqual(people["Beta"].total, 10)
+        self.assertEqual(people["Beta"].previous_count, 0)
         self.assertNotIn("广告号", people)
         daily = {point.day: point for point in result.current.daily}
         self.assertEqual(daily["2026-10-05"].total, 15)
@@ -486,16 +541,16 @@ class DatabaseTests(unittest.TestCase):
                 date_field="日期",
                 name_field="名字",
                 metric_field="",
-                names=["张三"],
+                names=["Alpha"],
                 exclude_keywords=["广告"],
                 compare_mode="week",
                 reference_date=date(2026, 10, 6),
             )
-        self.assertEqual(result.scope, "全部队别 · 张三")
+        self.assertEqual(result.scope, "全部队别 · Alpha")
         self.assertEqual(result.metric_field, "记录数")
         self.assertEqual(result.current.count, 2)
         self.assertEqual(result.current.total, 2)
-        self.assertEqual([item.name for item in result.people], ["张三"])
+        self.assertEqual([item.name for item in result.people], ["Alpha"])
 
     def test_analyze_custom_period_and_missing_person(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -526,28 +581,28 @@ class DatabaseTests(unittest.TestCase):
                 )
 
     def test_pick_header_follows_schema_and_skips_lead_name(self):
-        headers = ["队别", "状态", "交教会日期", "组别", "摸底/推广", "见证日期", "线索名字"]
-        self.assertEqual(pick_header(headers, ("日期", "时间")), "交教会日期")
+        headers = ["队别", "状态", "报名日期", "组别", "姓名", "完成日期", "客户名"]
+        self.assertEqual(pick_header(headers, ("日期", "时间")), "报名日期")
         self.assertEqual(pick_header(headers, ("队别", "队伍")), "队别")
-        self.assertEqual(pick_header(headers, ("摸底/推广", "姓名", "名字"), ("线索",)), "摸底/推广")
+        self.assertEqual(pick_header(headers, ("姓名", "名字"), ("线索",)), "姓名")
         self.assertEqual(
             list_matching_headers(headers, DATE_HEADER_HINTS),
-            ["交教会日期", "见证日期"],
+            ["报名日期", "完成日期"],
         )
-        self.assertFalse(is_stat_numeric_header("线索电话号码"))
-        self.assertFalse(is_stat_numeric_header("贴文链接"))
+        self.assertFalse(is_stat_numeric_header("联系电话"))
+        self.assertFalse(is_stat_numeric_header("条目链接"))
         self.assertTrue(is_stat_numeric_header("业绩"))
-        self.assertTrue(is_chart_header("加友途径4"))
-        self.assertFalse(is_chart_header("线索电话号码"))
+        self.assertTrue(is_chart_header("渠道"))
+        self.assertFalse(is_chart_header("联系电话"))
         self.assertEqual(
-            list_chart_headers(headers + ["线索电话号码", "加友途径4", "贴文链接"]),
-            ["状态", "组别", "加友途径4", "队别", "摸底/推广", "线索名字"],
+            list_chart_headers(headers + ["联系电话", "渠道", "条目链接"]),
+            ["状态", "组别", "渠道", "队别", "姓名", "客户名"],
         )
-        self.assertEqual(list_name_headers(headers), ["摸底/推广", "线索名字"])
+        self.assertEqual(list_name_headers(headers), ["姓名"])
         self.assertTrue(is_session_header("第一场"))
         self.assertTrue(is_session_header("第八场"))
         self.assertFalse(is_session_header("市场"))
-        self.assertTrue(cell_has_d("10.6 D 97min/笔聊73min"))
+        self.assertTrue(cell_has_d("10.6 D 97min"))
         self.assertTrue(cell_has_d("①D 2min"))
         self.assertFalse(cell_has_d("Não"))
         self.assertFalse(cell_has_d("10.2 1min"))
@@ -555,10 +610,10 @@ class DatabaseTests(unittest.TestCase):
 
     def test_analyze_team_and_name_are_independent(self):
         records = [
-            Record("s", "交教会", "g", "浇灌", 2, {"队别": "安桑1队", "交教会日期": "2026-10-05", "摸底/推广": "心路Maria/张小川"}, "a"),
-            Record("s", "交教会", "g", "浇灌", 3, {"队别": "安桑1队", "交教会日期": "2026-10-06", "摸底/推广": "安雨Anna/张小川3"}, "b"),
-            Record("s", "交教会", "g", "浇灌", 4, {"队别": "华人队", "交教会日期": "2026-10-06", "摸底/推广": "心路Maria/张小川"}, "c"),
-            Record("s", "交教会", "g", "浇灌", 5, {"队别": "安桑1队", "交教会日期": "2026-10-06", "摸底/推广": "智岩/阿黎"}, "d"),
+            Record("s", "数据源A", "g", "工作表A", 2, {"队别": "一队", "报名日期": "2026-10-05", "姓名": "StaffA"}, "a"),
+            Record("s", "数据源A", "g", "工作表A", 3, {"队别": "一队", "报名日期": "2026-10-06", "姓名": "StaffA"}, "b"),
+            Record("s", "数据源A", "g", "工作表A", 4, {"队别": "二队", "报名日期": "2026-10-06", "姓名": "StaffA"}, "c"),
+            Record("s", "数据源A", "g", "工作表A", 5, {"队别": "一队", "报名日期": "2026-10-06", "姓名": "StaffC"}, "d"),
         ]
         with tempfile.TemporaryDirectory() as directory:
             store = ConfigStore(Path(directory) / "config")
@@ -566,48 +621,48 @@ class DatabaseTests(unittest.TestCase):
             engine.database.replace_all(records)
             whole_team = engine.analyze(
                 source="aggregate",
-                team="安桑1队",
+                team="一队",
                 compare_mode="week",
                 reference_date=date(2026, 10, 6),
             )
             person = engine.analyze(
                 source="aggregate",
-                team="安桑1队",
-                names=["张小川"],
+                team="一队",
+                names=["StaffA"],
                 compare_mode="week",
                 reference_date=date(2026, 10, 6),
             )
             all_teams_person = engine.analyze(
                 source="aggregate",
-                names=["张小川"],
+                names=["StaffA"],
                 compare_mode="week",
                 reference_date=date(2026, 10, 6),
             )
-        self.assertEqual(whole_team.date_field, "交教会日期")
+        self.assertEqual(whole_team.date_field, "报名日期")
         self.assertEqual(whole_team.team_field, "队别")
-        self.assertEqual(whole_team.name_field, "摸底/推广")
+        self.assertEqual(whole_team.name_field, "姓名")
         self.assertEqual(whole_team.current.count, 3)
-        self.assertEqual(whole_team.scope, "队别 安桑1队 · 整个队别")
+        self.assertEqual(whole_team.scope, "队别 一队 · 整个队别")
         self.assertEqual(person.current.count, 2)
-        self.assertEqual(person.scope, "队别 安桑1队 · 张小川")
+        self.assertEqual(person.scope, "队别 一队 · StaffA")
         self.assertEqual(all_teams_person.current.count, 3)
-        self.assertEqual(all_teams_person.scope, "全部队别 · 张小川")
+        self.assertEqual(all_teams_person.scope, "全部队别 · StaffA")
 
     def test_analyze_uses_selected_date_column(self):
         records = [
-            Record("s", "交教会", "g", "浇灌", 2, {
-                "队别": "安桑1队",
-                "交教会日期": "2026-10-05",
-                "见证日期": "2026-09-28",
-                "摸底/推广": "张小川",
-                "线索电话号码": "15512345678",
+            Record("s", "数据源A", "g", "工作表A", 2, {
+                "队别": "一队",
+                "报名日期": "2026-10-05",
+                "完成日期": "2026-09-28",
+                "姓名": "StaffA",
+                "联系电话": "15512345678",
             }, "a"),
-            Record("s", "交教会", "g", "浇灌", 3, {
-                "队别": "安桑1队",
-                "交教会日期": "2026-10-06",
-                "见证日期": "2026-10-06",
-                "摸底/推广": "李四",
-                "线索电话号码": "15587654321",
+            Record("s", "数据源A", "g", "工作表A", 3, {
+                "队别": "一队",
+                "报名日期": "2026-10-06",
+                "完成日期": "2026-10-06",
+                "姓名": "Beta",
+                "联系电话": "15587654321",
             }, "b"),
         ]
         with tempfile.TemporaryDirectory() as directory:
@@ -616,42 +671,42 @@ class DatabaseTests(unittest.TestCase):
             engine.database.replace_all(records)
             by_meet = engine.analyze(
                 source="aggregate",
-                date_field="交教会日期",
+                date_field="报名日期",
                 compare_mode="week",
                 reference_date=date(2026, 10, 6),
             )
             by_witness = engine.analyze(
                 source="aggregate",
-                date_field="见证日期",
+                date_field="完成日期",
                 compare_mode="week",
                 reference_date=date(2026, 10, 6),
             )
-        self.assertEqual(by_meet.date_field, "交教会日期")
+        self.assertEqual(by_meet.date_field, "报名日期")
         self.assertEqual(by_meet.current.count, 2)
         self.assertEqual(by_meet.previous.count, 0)
-        self.assertEqual(by_witness.date_field, "见证日期")
+        self.assertEqual(by_witness.date_field, "完成日期")
         self.assertEqual(by_witness.current.count, 1)
         self.assertEqual(by_witness.previous.count, 1)
         self.assertEqual([point.day for point in by_meet.previous.daily], ["2026-09-28", "2026-09-29"])
-        phones = {item.name: item for item in by_meet.header_stats}["线索电话号码"]
+        phones = {item.name: item for item in by_meet.header_stats}["联系电话"]
         self.assertFalse(phones.numeric)
         self.assertIsNone(phones.total)
         self.assertEqual(phones.count, 2)
-        self.assertNotIn("交教会日期", {item.name for item in by_meet.header_stats})
+        self.assertNotIn("报名日期", {item.name for item in by_meet.header_stats})
 
     def test_analyze_splits_channel_header_into_series(self):
         records = [
-            Record("s", "交教会", "g", "浇灌", 2, {
-                "交教会日期": "2026-10-05", "加友途径4": "Facebook", "摸底/推广": "张三",
+            Record("s", "数据源A", "g", "工作表A", 2, {
+                "报名日期": "2026-10-05", "渠道": "Facebook", "姓名": "Alpha",
             }, "a"),
-            Record("s", "交教会", "g", "浇灌", 3, {
-                "交教会日期": "2026-10-05", "加友途径4": "WhatsApp", "摸底/推广": "李四",
+            Record("s", "数据源A", "g", "工作表A", 3, {
+                "报名日期": "2026-10-05", "渠道": "WhatsApp", "姓名": "Beta",
             }, "b"),
-            Record("s", "交教会", "g", "浇灌", 4, {
-                "交教会日期": "2026-10-06", "加友途径4": "Facebook", "摸底/推广": "张三",
+            Record("s", "数据源A", "g", "工作表A", 4, {
+                "报名日期": "2026-10-06", "渠道": "Facebook", "姓名": "Alpha",
             }, "c"),
-            Record("s", "交教会", "g", "浇灌", 5, {
-                "交教会日期": "2026-09-28", "加友途径4": "Facebook", "摸底/推广": "张三",
+            Record("s", "数据源A", "g", "工作表A", 5, {
+                "报名日期": "2026-09-28", "渠道": "Facebook", "姓名": "Alpha",
             }, "d"),
         ]
         with tempfile.TemporaryDirectory() as directory:
@@ -660,19 +715,19 @@ class DatabaseTests(unittest.TestCase):
             engine.database.replace_all(records)
             compared = engine.analyze(
                 source="aggregate",
-                date_field="交教会日期",
+                date_field="报名日期",
                 compare_mode="week",
                 compare=True,
                 reference_date=date(2026, 10, 6),
             )
             current_only = engine.analyze(
                 source="aggregate",
-                date_field="交教会日期",
+                date_field="报名日期",
                 compare_mode="month",
                 compare=False,
                 reference_date=date(2026, 10, 6),
             )
-        channels = {item.header: item for item in compared.breakdowns}["加友途径4"]
+        channels = {item.header: item for item in compared.breakdowns}["渠道"]
         series = {part.label: part for part in channels.series}
         self.assertEqual(series["Facebook"].count, 2)
         self.assertEqual(series["WhatsApp"].count, 1)
@@ -686,14 +741,14 @@ class DatabaseTests(unittest.TestCase):
 
     def test_analyze_uses_selected_name_column(self):
         records = [
-            Record("s", "交教会", "g", "浇灌", 2, {
-                "交教会日期": "2026-10-05", "摸底/推广": "张小川", "线索名字": "小明",
+            Record("s", "数据源A", "g", "工作表A", 2, {
+                "报名日期": "2026-10-05", "姓名": "StaffA", "客户名": "LeadA",
             }, "a"),
-            Record("s", "交教会", "g", "浇灌", 3, {
-                "交教会日期": "2026-10-06", "摸底/推广": "张小川", "线索名字": "小红",
+            Record("s", "数据源A", "g", "工作表A", 3, {
+                "报名日期": "2026-10-06", "姓名": "StaffA", "客户名": "LeadB",
             }, "b"),
-            Record("s", "交教会", "g", "浇灌", 4, {
-                "交教会日期": "2026-10-06", "摸底/推广": "李四", "线索名字": "小明",
+            Record("s", "数据源A", "g", "工作表A", 4, {
+                "报名日期": "2026-10-06", "姓名": "Beta", "客户名": "LeadA",
             }, "c"),
         ]
         with tempfile.TemporaryDirectory() as directory:
@@ -702,40 +757,40 @@ class DatabaseTests(unittest.TestCase):
             engine.database.replace_all(records)
             by_lead = engine.analyze(
                 source="aggregate",
-                date_field="交教会日期",
-                name_field="线索名字",
-                names=["小明"],
+                date_field="报名日期",
+                name_field="客户名",
+                names=["LeadA"],
                 compare_mode="week",
                 compare=False,
                 reference_date=date(2026, 10, 6),
             )
             by_staff = engine.analyze(
                 source="aggregate",
-                date_field="交教会日期",
-                name_field="摸底/推广",
-                names=["张小川"],
+                date_field="报名日期",
+                name_field="姓名",
+                names=["StaffA"],
                 compare_mode="week",
                 compare=False,
                 reference_date=date(2026, 10, 6),
             )
-        self.assertEqual(by_lead.name_field, "线索名字")
+        self.assertEqual(by_lead.name_field, "客户名")
         self.assertEqual(by_lead.current.count, 2)
-        self.assertEqual(by_staff.name_field, "摸底/推广")
+        self.assertEqual(by_staff.name_field, "姓名")
         self.assertEqual(by_staff.current.count, 2)
 
     def test_analyze_session_header_counts_d_not_durations(self):
         records = [
-            Record("s", "交教会", "g", "浇灌", 2, {
-                "交教会日期": "2026-10-05", "第一场": "Não", "摸底/推广": "张三",
+            Record("s", "数据源A", "g", "工作表A", 2, {
+                "报名日期": "2026-10-05", "第一场": "Não", "姓名": "Alpha",
             }, "a"),
-            Record("s", "交教会", "g", "浇灌", 3, {
-                "交教会日期": "2026-10-05", "第一场": "10.6 D 97min/笔聊73min", "摸底/推广": "李四",
+            Record("s", "数据源A", "g", "工作表A", 3, {
+                "报名日期": "2026-10-05", "第一场": "10.6 D 97min", "姓名": "Beta",
             }, "b"),
-            Record("s", "交教会", "g", "浇灌", 4, {
-                "交教会日期": "2026-10-06", "第一场": "10.2 1min", "摸底/推广": "张三",
+            Record("s", "数据源A", "g", "工作表A", 4, {
+                "报名日期": "2026-10-06", "第一场": "10.2 1min", "姓名": "Alpha",
             }, "c"),
-            Record("s", "交教会", "g", "浇灌", 5, {
-                "交教会日期": "2026-10-06", "第一场": "①D 2min", "摸底/推广": "王五",
+            Record("s", "数据源A", "g", "工作表A", 5, {
+                "报名日期": "2026-10-06", "第一场": "①D 2min", "姓名": "Gamma",
             }, "d"),
         ]
         with tempfile.TemporaryDirectory() as directory:
@@ -744,7 +799,7 @@ class DatabaseTests(unittest.TestCase):
             engine.database.replace_all(records)
             result = engine.analyze(
                 source="aggregate",
-                date_field="交教会日期",
+                date_field="报名日期",
                 compare_mode="week",
                 compare=False,
                 reference_date=date(2026, 10, 6),
@@ -761,7 +816,7 @@ class DatabaseTests(unittest.TestCase):
     def test_source_cache_merge_skips_unchanged_rows(self):
         with tempfile.TemporaryDirectory() as directory:
             cache = SourceCache(Path(directory))
-            first_rows = [Record("s", "源", "g", "表", 2, {"名字": "张三"}, "h1")]
+            first_rows = [Record("s", "源", "g", "表", 2, {"名字": "Alpha"}, "h1")]
             first = cache.merge("s", first_rows, ["名字"])
             self.assertEqual(first["inserted"], 1)
             self.assertFalse(first["unchanged"])
@@ -769,12 +824,12 @@ class DatabaseTests(unittest.TestCase):
             self.assertTrue(same["unchanged"])
             self.assertEqual(same["skipped"], 1)
             self.assertEqual(same["updated"], 0)
-            changed = [Record("s", "源", "g", "表", 2, {"名字": "李四"}, "h2")]
+            changed = [Record("s", "源", "g", "表", 2, {"名字": "Beta"}, "h2")]
             updated = cache.merge("s", changed, ["名字"])
             self.assertEqual(updated["updated"], 1)
             self.assertEqual(updated["inserted"], 0)
             self.assertFalse(updated["unchanged"])
-            self.assertEqual(cache.load("s")[0].values["名字"], "李四")
+            self.assertEqual(cache.load("s")[0].values["名字"], "Beta")
 
     def test_cached_records_require_local_without_sync(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -789,11 +844,11 @@ class DatabaseTests(unittest.TestCase):
             store = ConfigStore(Path(directory) / "config")
             engine = DataEngine(store)
             engine.database.replace_all([
-                Record("s", "源", "g", "A", 2, {"号码": "258-851-758692"}, "h1"),
-                Record("s", "源", "g", "B", 3, {"手机号码": "258851758692"}, "h2"),
+                Record("s", "源", "g", "A", 2, {"号码": "138-000-00000"}, "h1"),
+                Record("s", "源", "g", "B", 3, {"手机号码": "13800000000"}, "h2"),
                 Record("s", "源", "g", "C", 4, {"号码": "999"}, "h3"),
             ])
-            results = engine.query_many("号码", ["258851758692", "000"], exact=True)
+            results = engine.query_many("号码", ["13800000000", "000"], exact=True)
             self.assertEqual([record.sheet_name if record else None for _, record in results], ["A", "B", None])
 
     def test_batch_query_fuzzy_reuses_prepared_values(self):
@@ -801,44 +856,44 @@ class DatabaseTests(unittest.TestCase):
             store = ConfigStore(Path(directory) / "config")
             engine = DataEngine(store)
             engine.database.replace_all([
-                Record("s", "源", "g", "1008-李薇", 2, {"号码": "123"}, "h1"),
-                Record("s", "源", "g", "AAOZ-依心", 3, {"号码": "456"}, "h2"),
+                Record("s", "源", "g", "1008-PersonX", 2, {"号码": "123"}, "h1"),
+                Record("s", "源", "g", "2002-PersonZ", 3, {"号码": "456"}, "h2"),
             ])
-            results = engine.query_many("来源", ["李薇", "依心"], exact=False)
-            self.assertEqual([record.sheet_name for _, record in results if record], ["1008-李薇", "AAOZ-依心"])
+            results = engine.query_many("来源", ["PersonX", "PersonZ"], exact=False)
+            self.assertEqual([record.sheet_name for _, record in results if record], ["1008-PersonX", "2002-PersonZ"])
 
     def test_fuzzy_source_query_matches_original_and_corrected_sheet_name(self):
         with tempfile.TemporaryDirectory() as directory:
             store = ConfigStore(Path(directory) / "config")
             engine = DataEngine(store)
             engine.database.replace_all([
-                Record("s", "源", "g", "1233-赵刚", 2, {"号码": "123"}, "h1")
+                Record("s", "源", "g", "1233-PersonY", 2, {"号码": "123"}, "h1")
             ])
-            for value in ("赵刚", "1233", "1233-赵刚", "赵刚-1233-专页后台"):
+            for value in ("PersonY", "1233", "1233-PersonY", "PersonY-1233-专页后台"):
                 results = engine.query_many("来源", [value], exact=False)
-                self.assertEqual(results[0][1].sheet_name, "1233-赵刚")
+                self.assertEqual(results[0][1].sheet_name, "1233-PersonY")
 
     def test_exact_source_query_matches_corrected_sheet_name(self):
         with tempfile.TemporaryDirectory() as directory:
             store = ConfigStore(Path(directory) / "config")
             engine = DataEngine(store)
             engine.database.replace_all([
-                Record("s", "源", "g", "1233-赵刚", 2, {"号码": "123"}, "h1")
+                Record("s", "源", "g", "1233-PersonY", 2, {"号码": "123"}, "h1")
             ])
-            results = engine.query_many("来源", ["赵刚-1233-专页后台"], exact=True)
-            self.assertEqual(results[0][1].sheet_name, "1233-赵刚")
+            results = engine.query_many("来源", ["PersonY-1233-专页后台"], exact=True)
+            self.assertEqual(results[0][1].sheet_name, "1233-PersonY")
 
     def test_query_can_limit_results_by_date_range(self):
         with tempfile.TemporaryDirectory() as directory:
             store = ConfigStore(Path(directory) / "config")
             engine = DataEngine(store)
             engine.database.replace_all([
-                Record("s", "源", "g", "A", 2, {"名字": "刘海", "日期": "2026-09-01"}, "h1"),
-                Record("s", "源", "g", "B", 3, {"名字": "刘海", "日期": "2026-09-13"}, "h2"),
-                Record("s", "源", "g", "C", 4, {"名字": "刘海", "日期": "无效日期"}, "h3"),
+                Record("s", "源", "g", "A", 2, {"名字": "PersonW", "日期": "2026-09-01"}, "h1"),
+                Record("s", "源", "g", "B", 3, {"名字": "PersonW", "日期": "2026-09-13"}, "h2"),
+                Record("s", "源", "g", "C", 4, {"名字": "PersonW", "日期": "无效日期"}, "h3"),
             ])
             results = engine.query_many(
-                "名字", ["刘海"], exact=True, date_field="日期",
+                "名字", ["PersonW"], exact=True, date_field="日期",
                 start_date=date(2026, 9, 10), end_date=date(2026, 9, 20),
             )
             self.assertEqual(len(results), 1)
@@ -852,22 +907,22 @@ class DatabaseTests(unittest.TestCase):
                 Record(
                     "s", "源", "g", "A", 2,
                     {
-                        "交教会日期": "2026年9月13日",
-                        "线索电话号码": "258-851-758692",
-                        "摸底/推广": "简\u200b 单",
+                        "报名日期": "2026年9月13日",
+                        "联系电话": "138-000-00000",
+                        "姓名": "简\u200b 单",
                     },
                     "h1",
                 ),
             ])
             results = engine.query_many(
-                "摸底/推广", ["简单"], exact=False, date_field="日期",
+                "姓名", ["简单"], exact=False, date_field="日期",
                 start_date=date(2026, 9, 1), end_date=date(2026, 9, 30),
             )
             self.assertIsNotNone(results[0][1])
-            self.assertEqual(engine.query("号码", "258851758692")[0].sheet_name, "A")
+            self.assertEqual(engine.query("号码", "13800000000")[0].sheet_name, "A")
             self.assertEqual(
-                engine.suggest_field(["交教会日期", "摸底/推广"], "日期"),
-                "交教会日期",
+                engine.suggest_field(["报名日期", "姓名"], "日期"),
+                "报名日期",
             )
 
     def test_extract_resolves_custom_date_and_dedup_headers(self):
@@ -878,7 +933,7 @@ class DatabaseTests(unittest.TestCase):
             engine.database.replace_all([
                 Record(
                     "s", "源", "g", "A", 2,
-                    {"交教会日期": "2026-09-13", "线索电话号码": "123"},
+                    {"报名日期": "2026-09-13", "联系电话": "123"},
                     "h1",
                 ),
             ])
@@ -901,7 +956,7 @@ class DatabaseTests(unittest.TestCase):
             sheet = workbook.active
             sheet.title = "提取结果"
             sheet.append(["来源", "手机号码", "日期"])
-            sheet.append(["历史来源", "258-851-758692", "2026-09-13"])
+            sheet.append(["历史来源", "138-000-00000", "2026-09-13"])
             workbook.save(output)
             workbook.close()
 
@@ -910,7 +965,7 @@ class DatabaseTests(unittest.TestCase):
             engine.database.replace_all([
                 Record(
                     "s", "源", "g", "新来源", 2,
-                    {"号码": "258851758692", "日期": "2026-09-13"},
+                    {"号码": "13800000000", "日期": "2026-09-13"},
                     "h1",
                 ),
             ])
@@ -971,11 +1026,11 @@ class DatabaseTests(unittest.TestCase):
             engine = DataEngine(store)
             records = [
                 Record(
-                    "src2", "源二", "g", "浇灌数据库-过滤", 2,
+                    "src2", "源二", "g", "明细表", 2,
                     {
-                        "交教会日期": "2026-09-13",
-                        "线索电话号码": "258851758692",
-                        "摸底/推广": "简单",
+                        "报名日期": "2026-09-13",
+                        "联系电话": "13800000000",
+                        "姓名": "简单",
                     },
                     "h1",
                 )
@@ -994,8 +1049,8 @@ class DatabaseTests(unittest.TestCase):
                 rows = list(sheet.iter_rows(values_only=True))
             finally:
                 workbook.close()
-            self.assertEqual(rows[0], ("来源", "交教会日期", "线索电话号码", "摸底/推广"))
-            self.assertEqual(rows[1], ("浇灌数据库-过滤", "2026-09-13", "258851758692", "简单"))
+            self.assertEqual(rows[0], ("来源", "报名日期", "联系电话", "姓名"))
+            self.assertEqual(rows[1], ("明细表", "2026-09-13", "13800000000", "简单"))
 
     def test_direct_extract_signature_column_is_added_to_new_output(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1003,14 +1058,14 @@ class DatabaseTests(unittest.TestCase):
             store = ConfigStore(root / "config")
             store.set("extract_signature_enabled", True)
             store.set("extract_signature_header", "签字")
-            store.set("extract_signature_value", "张三")
+            store.set("extract_signature_value", "Alpha")
             store.set("extract_signature_column", "K")
             engine = DataEngine(store)
             output = root / "signature.xlsx"
             records = [
                 Record(
-                    "src", "源", "g", "浇灌数据库-过滤", 2,
-                    {"交教会日期": "2026-09-13", "线索电话号码": "258851758692", "摸底/推广": "简单"},
+                    "src", "源", "g", "明细表", 2,
+                    {"报名日期": "2026-09-13", "联系电话": "13800000000", "姓名": "简单"},
                     "h1",
                 )
             ]
@@ -1027,19 +1082,19 @@ class DatabaseTests(unittest.TestCase):
                 workbook.close()
             self.assertEqual(rows[0][0], "来源")
             self.assertEqual(rows[0][10], "签字")
-            self.assertEqual(rows[1][10], "张三")
+            self.assertEqual(rows[1][10], "Alpha")
 
     def test_extract_output_schema_supports_column_mapping_objects(self):
         with tempfile.TemporaryDirectory() as directory:
             store = ConfigStore(Path(directory) / "config")
             store.set("extract_column_schema_enabled", True)
             store.set("extract_column_schema", [
-                {"name": "线索电话号码", "column": "S", "enabled": True},
-                {"name": "交教会日期", "column": "F", "enabled": True},
+                {"name": "联系电话", "column": "S", "enabled": True},
+                {"name": "报名日期", "column": "F", "enabled": True},
             ])
             engine = DataEngine(store)
             headers = engine._preferred_export_headers([])
-            self.assertEqual(headers, ["来源", "线索电话号码", "交教会日期"])
+            self.assertEqual(headers, ["来源", "联系电话", "报名日期"])
             rows = engine._rows_for_headers(
                 [Record("s", "源", "g", "A", 2, {"号码": "123", "日期": "2026-09-13"}, "h")],
                 headers,
@@ -1055,7 +1110,7 @@ class DatabaseTests(unittest.TestCase):
             DataEngine._write_xlsx(
                 extract_path,
                 [
-                    Record("s", "源", "g", "1008-李薇", 2, {"号码": "123", "名字": "李薇", "日期": "2026-09-13"}, "h1"),
+                    Record("s", "源", "g", "1008-PersonX", 2, {"号码": "123", "名字": "PersonX", "日期": "2026-09-13"}, "h1"),
                     Record("s", "源", "g", "2002-王强", 3, {"号码": "456", "名字": "王强", "日期": "2026-09-12"}, "h2"),
                 ],
                 "提取结果",
@@ -1074,7 +1129,7 @@ class DatabaseTests(unittest.TestCase):
                 extract_sheet="提取结果",
                 refresh_cache=True,
             )
-            self.assertEqual(results[0][1].sheet_name, "1008-李薇")
+            self.assertEqual(results[0][1].sheet_name, "1008-PersonX")
             self.assertEqual(results[0][1].values["号码"], "123")
             self.assertIsNone(results[1][1])
             found = engine.query(
@@ -1092,7 +1147,7 @@ class DatabaseTests(unittest.TestCase):
             self.assertTrue(any(name in {"号码", "手机号码"} for name in headers))
             by_header = engine.query(
                 "名字",
-                "李薇",
+                "PersonX",
                 source="extract",
                 extract_target=str(extract_path),
                 extract_sheet="提取结果",
@@ -1121,13 +1176,13 @@ class DatabaseTests(unittest.TestCase):
         required = ["来源", "日期", "名字", "号码", "专页ID"]
         self.assertTrue(DataEngine._headers_compatible(existing, required, aliases))
         records = [Record(
-            "s", "源", "g", "1008-李薇", 2,
-            {"专页ID": "42", "名字": "李薇", "号码": "258851758692", "日期": "2026-09-13"},
+            "s", "源", "g", "1008-PersonX", 2,
+            {"专页ID": "42", "名字": "PersonX", "号码": "13800000000", "日期": "2026-09-13"},
             "h",
         )]
         self.assertEqual(
             DataEngine._rows_for_headers(records, existing, aliases)[0],
-            ["1008-李薇", "42", "李薇", "258851758692", "2026-09-13"],
+            ["1008-PersonX", "42", "PersonX", "13800000000", "2026-09-13"],
         )
 
 
@@ -1162,7 +1217,7 @@ class WorkbookTests(unittest.TestCase):
             long = openpyxl.Workbook()
             long.active.title = "长表"
             long.active.append(["a", "b", "c", "d"])
-            long.active.append(["page-2", "李薇", "https://example.test", "258851758692"])
+            long.active.append(["page-2", "PersonX", "https://example.test", "13800000000"])
             long.save(long_path)
             store = ConfigStore(Path(directory) / "config")
             store.save_source(SourceConfig(
@@ -1173,7 +1228,7 @@ class WorkbookTests(unittest.TestCase):
             store.save_source(SourceConfig(
                 "long", "长表", str(long_path),
                 column_schema_enabled=True,
-                column_schema=["专页ID", "姓名", "评论贴文", "手机号码"],
+                column_schema=["专页ID", "姓名", "备注链接", "手机号码"],
             ))
             engine = DataEngine(store)
             records = engine.read_sources()
@@ -1181,14 +1236,14 @@ class WorkbookTests(unittest.TestCase):
             self.assertEqual(by_source["short"].values["专页ID"], "page-1")
             self.assertEqual(by_source["short"].values["号码"], "13800138000")
             self.assertNotIn("ignore", by_source["short"].values)
-            self.assertEqual(by_source["long"].values["名字"], "李薇")
-            self.assertEqual(by_source["long"].values["号码"], "258851758692")
-            self.assertEqual(by_source["long"].values["评论贴文"], "https://example.test")
+            self.assertEqual(by_source["long"].values["名字"], "PersonX")
+            self.assertEqual(by_source["long"].values["号码"], "13800000000")
+            self.assertEqual(by_source["long"].values["备注链接"], "https://example.test")
             short_fields = engine.list_query_fields("direct", source_id="short")
             long_fields = engine.list_query_fields("direct", source_id="long")
             self.assertIn("手机号码", short_fields)
-            self.assertNotIn("评论贴文", short_fields)
-            self.assertIn("评论贴文", long_fields)
+            self.assertNotIn("备注链接", short_fields)
+            self.assertIn("备注链接", long_fields)
             self.assertEqual(
                 engine.query(
                     "手机号码", "13800138000", source="direct", source_id="short", refresh_cache=True,
@@ -1221,20 +1276,20 @@ class WorkbookTests(unittest.TestCase):
             book = openpyxl.Workbook()
             sheet = book.active
             sheet.title = "数据"
-            sheet.append(["A列", "B列", "C列", "贴文ID", "手机号码", "多余"])
+            sheet.append(["A列", "B列", "C列", "条目ID", "手机号码", "多余"])
             sheet.append(["x", "y", "z", "page-9", "13800138000", "no"])
             book.save(path)
             reader = SourceReader(
                 {"号码": ["手机号码"]},
                 [],
                 column_schema=[
-                    {"name": "贴文ID", "column": "D", "enabled": True},
+                    {"name": "条目ID", "column": "D", "enabled": True},
                     {"name": "手机号码", "column": "E", "enabled": True},
                     {"name": "忽略", "column": "F", "enabled": False},
                 ],
             )
             records = reader.read(SourceConfig("id", "列映射", str(path)))
-            self.assertEqual(records[0].values["贴文ID"], "page-9")
+            self.assertEqual(records[0].values["条目ID"], "page-9")
             self.assertEqual(records[0].values["号码"], "13800138000")
             self.assertNotIn("忽略", records[0].values)
             self.assertNotIn("A列", records[0].values)
@@ -1314,7 +1369,7 @@ class WorkbookTests(unittest.TestCase):
 
             def values_get(self, key, range_name, params=None):
                 if str(range_name).endswith("!A:ZZZ"):
-                    return {"values": [existing, ["旧来源", "258-851-758692", "2026-09-13"]]}
+                    return {"values": [existing, ["旧来源", "138-000-00000", "2026-09-13"]]}
                 return {"values": [existing]}
 
             def batch_update(self, key, body=None):
@@ -1332,7 +1387,7 @@ class WorkbookTests(unittest.TestCase):
             engine.database.replace_all([
                 Record(
                     "s", "源", "g", "新来源", 2,
-                    {"号码": "258851758692", "日期": "2026-09-13"},
+                    {"号码": "13800000000", "日期": "2026-09-13"},
                     "h1",
                 ),
             ])
@@ -1350,7 +1405,7 @@ class WorkbookTests(unittest.TestCase):
         self.assertEqual(http.written, [])
 
     def test_google_output_uses_existing_alias_header_order(self):
-        existing = ["来源", "专页ID", "姓名", "标签", "订阅时间", "性别", "评论贴文", "手机号码", "日期"]
+        existing = ["来源", "专页ID", "姓名", "标签", "订阅时间", "性别", "备注链接", "手机号码", "日期"]
 
         class FakeHttp:
             def __init__(self):
@@ -1378,10 +1433,10 @@ class WorkbookTests(unittest.TestCase):
             store.set("column_schema", existing[1:])
             engine = DataEngine(store)
             records = [Record(
-                "s", "源", "g", "1008-李薇", 2,
+                "s", "源", "g", "1008-PersonX", 2,
                 {
-                    "专页ID": "42", "名字": "李薇", "标签": "A", "订阅时间": "12:00",
-                    "性别": "女", "评论贴文": "https://example.test", "号码": "258851758692",
+                    "专页ID": "42", "名字": "PersonX", "标签": "A", "订阅时间": "12:00",
+                    "性别": "女", "备注链接": "https://example.test", "号码": "13800000000",
                     "日期": "2026-09-13",
                 },
                 "h",
@@ -1395,12 +1450,12 @@ class WorkbookTests(unittest.TestCase):
                 )
         self.assertEqual(http.inserted[0]["insertDimension"]["range"]["startIndex"], 1)
         self.assertEqual(http.written[0], [
-            "1008-李薇", "42", "李薇", "A", "12:00", "女", "https://example.test",
-            "258851758692", "2026-09-13",
+            "1008-PersonX", "42", "PersonX", "A", "12:00", "女", "https://example.test",
+            "13800000000", "2026-09-13",
         ])
 
     def test_google_output_uses_existing_headers_without_rejecting_mismatch(self):
-        existing = ["来源", "专页ID", "姓名", "标签", "订阅时间", "性别", "评论贴文", "手机号码", "日期", "签字"]
+        existing = ["来源", "专页ID", "姓名", "标签", "订阅时间", "性别", "备注链接", "手机号码", "日期", "签字"]
 
         class FakeHttp:
             def __init__(self):
@@ -1426,13 +1481,13 @@ class WorkbookTests(unittest.TestCase):
             store.set("credential_path", "fake.json")
             store.set("extract_signature_enabled", True)
             store.set("extract_signature_header", "签字")
-            store.set("extract_signature_value", "张三")
+            store.set("extract_signature_value", "Alpha")
             engine = DataEngine(store)
             records = [Record(
-                "s", "源", "g", "1008-李薇", 2,
+                "s", "源", "g", "1008-PersonX", 2,
                 {
-                    "日期": "2026-09-13", "名字": "李薇", "号码": "258851758692",
-                    "专页ID": "42", "评论贴文": "https://example.test",
+                    "日期": "2026-09-13", "名字": "PersonX", "号码": "13800000000",
+                    "专页ID": "42", "备注链接": "https://example.test",
                 },
                 "h",
             )]
@@ -1446,8 +1501,8 @@ class WorkbookTests(unittest.TestCase):
                 )
         self.assertEqual(http.inserted[0]["insertDimension"]["range"]["startIndex"], 1)
         self.assertEqual(http.written[0], [
-            "1008-李薇", "42", "李薇", "", "", "", "https://example.test",
-            "258851758692", "2026-09-13", "张三",
+            "1008-PersonX", "42", "PersonX", "", "", "", "https://example.test",
+            "13800000000", "2026-09-13", "Alpha",
         ])
 
 
