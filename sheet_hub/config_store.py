@@ -132,6 +132,7 @@ class ConfigStore:
             "analysis_direct_source_id": "",
             "analysis_date_field": "",
             "analysis_name_field": "",
+            "analysis_team_field": "",
             "analysis_metric_field": "",
             "analysis_scope": "team",
             "analysis_team": "",

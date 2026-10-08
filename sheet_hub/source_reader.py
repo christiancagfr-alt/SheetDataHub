@@ -10,6 +10,10 @@ from pathlib import Path
 from typing import Callable, Iterable
 from urllib.parse import urlparse
 
+import defusedxml
+
+defusedxml.defuse_stdlib()
+
 import openpyxl
 import requests
 
@@ -443,9 +447,17 @@ class SourceReader:
     def _gspread_client(credential: str):
         import gspread
 
-        path = Path(credential).expanduser()
+        path = Path(credential).expanduser().resolve()
         if not path.is_file() or path.suffix.lower() != ".json":
-            raise FileNotFoundError(f"服务账号 JSON 无效或不存在：{credential}")
+            raise FileNotFoundError(f"服务账号 JSON 无效或不存在：{path.name}")
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise FileNotFoundError(f"服务账号 JSON 无法读取：{path.name}") from exc
+        if not isinstance(payload, dict) or str(payload.get("type") or "") != "service_account":
+            raise FileNotFoundError(f"服务账号 JSON 类型无效：{path.name}")
+        if not str(payload.get("client_email") or "").strip() or not str(payload.get("private_key") or "").strip():
+            raise FileNotFoundError(f"服务账号 JSON 缺少必要字段：{path.name}")
         return gspread.service_account(filename=str(path))
 
     @staticmethod

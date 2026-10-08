@@ -9,16 +9,17 @@ from urllib.parse import urlparse
 import requests
 
 
-APP_VERSION = "1.4.1"
+APP_VERSION = "1.4.2"
 UPDATE_REPO = "christiancagfr-alt/SheetDataHub"
 RELEASES_URL = f"https://github.com/{UPDATE_REPO}/releases"
-INSTALLER_URL_PREFIXES = (
-    "https://github.com/",
-    "https://objects.githubusercontent.com/",
-    "https://release-assets.githubusercontent.com/",
-    "https://github-releases.githubusercontent.com/",
-)
+INSTALLER_DOWNLOAD_PREFIX = f"https://github.com/{UPDATE_REPO}/releases/download/"
+INSTALLER_CDN_HOSTS = {
+    "objects.githubusercontent.com",
+    "release-assets.githubusercontent.com",
+    "github-releases.githubusercontent.com",
+}
 MIN_INSTALLER_BYTES = 1024 * 1024
+MAX_INSTALLER_BYTES = 400 * 1024 * 1024
 
 
 def parse_version(text: str) -> tuple[int, ...]:
@@ -132,26 +133,48 @@ def installer_kind(name: str, url: str = "") -> str:
     return ""
 
 
+def _https_host(url: str) -> str:
+    parsed = urlparse(str(url or "").strip())
+    if parsed.scheme != "https" or parsed.username or parsed.password:
+        return ""
+    if parsed.port not in (None, 443):
+        return ""
+    return (parsed.hostname or "").casefold()
+
+
 def installer_url_allowed(url: str) -> bool:
     text = str(url or "").strip()
-    if not text.startswith("https://"):
+    if not text.startswith(INSTALLER_DOWNLOAD_PREFIX):
         return False
-    return any(text.startswith(prefix) for prefix in INSTALLER_URL_PREFIXES)
+    return _https_host(text) == "github.com"
+
+
+def installer_final_url_allowed(url: str) -> bool:
+    if installer_url_allowed(url):
+        return True
+    host = _https_host(url)
+    return bool(host) and host in INSTALLER_CDN_HOSTS
 
 
 def fetch_latest_release(timeout: int = 20, platform_name: str | None = None) -> dict[str, Any]:
+    api_url = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
     response = requests.get(
-        f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest",
+        api_url,
         timeout=timeout,
         headers={
             "Accept": "application/vnd.github+json",
             "User-Agent": "SheetDataHub",
         },
     )
+    final_api_url = str(getattr(response, "url", "") or api_url)
+    if _https_host(final_api_url) != "api.github.com":
+        raise RuntimeError("更新接口被重定向到非 GitHub 地址，已拒绝。")
     if response.status_code == 404:
         raise RuntimeError("还没有发布版本，稍后再试。")
     response.raise_for_status()
     data = response.json()
+    if not isinstance(data, dict):
+        raise RuntimeError("更新接口返回内容无效。")
     tag = str(data.get("tag_name") or "").strip()
     version = tag.lstrip("vV") or APP_VERSION
     assets = list(data.get("assets") or [])
@@ -205,16 +228,20 @@ def download_release_installer(
     if not url:
         raise RuntimeError("该版本没有当前系统可用的安装包，请稍后再试。")
     if not installer_url_allowed(url):
-        raise RuntimeError("安装包地址不是 GitHub 官方下载链接，已拒绝。")
+        raise RuntimeError("安装包地址不是本仓库的 GitHub 下载链接，已拒绝。")
     version = re.sub(r"[^0-9A-Za-z._-]", "_", str(info.get("version") or "latest"))
     kind = installer_kind(str(info.get("installer_name") or ""), url)
     if kind not in {"exe", "dmg", "zip"}:
         raise RuntimeError("该版本没有当前系统可用的安装包，请稍后再试。")
-    update_dir = Path(data_dir) / "updates"
+    update_dir = (Path(data_dir) / "updates").resolve()
     update_dir.mkdir(parents=True, exist_ok=True)
-    destination = update_dir / f"SheetDataHub-update-v{version}.{kind}"
+    destination = (update_dir / f"SheetDataHub-update-v{version}.{kind}").resolve()
+    if destination.parent != update_dir:
+        raise RuntimeError("安装包路径不在本机更新目录，已拒绝。")
     partial = destination.with_suffix(destination.suffix + ".part")
     expected_size = int(info.get("installer_size") or 0)
+    if expected_size and expected_size > MAX_INSTALLER_BYTES:
+        raise RuntimeError("安装包过大，已拒绝下载。")
     try:
         with requests.get(
             url,
@@ -224,14 +251,16 @@ def download_release_installer(
         ) as response:
             response.raise_for_status()
             final_url = str(getattr(response, "url", url) or url)
-            if not installer_url_allowed(final_url):
+            if not installer_final_url_allowed(final_url):
                 raise RuntimeError("安装包下载被重定向到非 GitHub 地址，已拒绝。")
             written = 0
             with partial.open("wb") as output:
                 for chunk in response.iter_content(chunk_size=1024 * 1024):
                     if chunk:
-                        output.write(chunk)
                         written += len(chunk)
+                        if written > MAX_INSTALLER_BYTES:
+                            raise RuntimeError("安装包过大，已中止下载。")
+                        output.write(chunk)
         if expected_size and written != expected_size:
             raise RuntimeError(f"安装包下载不完整：应为 {expected_size} 字节，实际 {written} 字节。")
         if written < MIN_INSTALLER_BYTES:

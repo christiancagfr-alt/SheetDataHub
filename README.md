@@ -20,7 +20,7 @@ python app.py
 
 侧栏「数据分析」使用你在「数据源」里已经配置好的表格。日期列、名字列可在下拉里切换。
 
-- 队别不选 = 全部队别；名字留空 = 该队全员。两者可单独筛选。
+- 队别列、日期列、名字列都可在下拉里切换。队别不选 = 全部队别；名字留空 = 该队全员。两者可单独筛选。
 - 默认时间是当月、不对比。可选最近 7 天、最近 2 天或自定义；勾选「对比」后才显示对比期。
 - 曲线上方用小方框勾选要画的列；太多时点「更多」。勾选分类列会按不同取值各画一条线。
 - 名称含「场」的列只统计单元格里含 D 的条数，不按时长拆线、也不累计分钟。
@@ -43,10 +43,10 @@ python app.py
 
 | 文件 | 说明 |
 |------|------|
-| `SheetDataHub-Setup-v1.4.1.exe` | Windows 安装程序（推荐） |
-| `SheetDataHub-windows-v1.4.1.zip` | Windows 免安装便携包，解压后运行 `SheetDataHub/SheetDataHub.exe` |
-| `SheetDataHub-macos-arm64-v1.4.1.dmg` | macOS 安装盘：打开后把 `SheetDataHub.app` 拖进「应用程序」 |
-| `SheetDataHub-macos-arm64-v1.4.1.zip` | macOS 便携包 |
+| `SheetDataHub-Setup-v1.4.2.exe` | Windows 安装程序（推荐） |
+| `SheetDataHub-windows-v1.4.2.zip` | Windows 免安装便携包，解压后运行 `SheetDataHub/SheetDataHub.exe` |
+| `SheetDataHub-macos-arm64-v1.4.2.dmg` | macOS 安装盘：打开后把 `SheetDataHub.app` 拖进「应用程序」 |
+| `SheetDataHub-macos-arm64-v1.4.2.zip` | macOS 便携包 |
 
 系统要求：Windows 10 / 11（64 位），或 macOS 12+（Apple Silicon）。Mac 若提示无法打开，按住 Control 单击图标再选打开。
 
@@ -55,9 +55,9 @@ python app.py
 下载后，使用 GitHub CLI 验证文件确实由官方 CI 构建、且未被篡改：
 
 ```bash
-gh attestation verify ./SheetDataHub-windows-v1.4.1.zip --repo christiancagfr-alt/SheetDataHub
-gh attestation verify ./SheetDataHub-Setup-v1.4.1.exe --repo christiancagfr-alt/SheetDataHub
-gh attestation verify ./SheetDataHub-macos-arm64-v1.4.1.dmg --repo christiancagfr-alt/SheetDataHub
+gh attestation verify ./SheetDataHub-windows-v1.4.2.zip --repo christiancagfr-alt/SheetDataHub
+gh attestation verify ./SheetDataHub-Setup-v1.4.2.exe --repo christiancagfr-alt/SheetDataHub
+gh attestation verify ./SheetDataHub-macos-arm64-v1.4.2.dmg --repo christiancagfr-alt/SheetDataHub
 ```
 
 验证成功表示该软件确实由官方 GitHub Actions 构建。

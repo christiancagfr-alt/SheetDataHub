@@ -20,9 +20,11 @@ from sheet_hub.engine import (
     is_session_header,
     is_stat_numeric_header,
     last_n_days_ranges,
+    TEAM_HEADER_HINTS,
     list_chart_headers,
     list_matching_headers,
     list_name_headers,
+    list_team_headers,
     month_compare_ranges,
     parse_date,
     parse_number,
@@ -42,8 +44,10 @@ from sheet_hub.source_reader import (
 from sheet_hub.ui import DEFAULT_QUERY_RESULT_FIELDS, is_phone_data_table, query_result_headers
 from sheet_hub.version import (
     APP_VERSION,
+    MAX_INSTALLER_BYTES,
     download_release_installer,
     fetch_latest_release,
+    installer_final_url_allowed,
     installer_url_allowed,
     is_newer,
     parse_version,
@@ -111,9 +115,31 @@ class RuleTests(unittest.TestCase):
 
         with patch("sheet_hub.version.requests.get", return_value=FakeJsonResponse()):
             info = fetch_latest_release(platform_name="win32")
+
+        class FakeApiRedirect(FakeJsonResponse):
+            url = "https://evil.test/latest"
+
+        with patch("sheet_hub.version.requests.get", return_value=FakeApiRedirect()):
+            with self.assertRaises(RuntimeError):
+                fetch_latest_release(platform_name="win32")
         self.assertTrue(installer_url_allowed(info["installer_url"]))
-        self.assertIn("github.com/", info["installer_url"])
+        self.assertIn("github.com/christiancagfr-alt/SheetDataHub/releases/download/", info["installer_url"])
         self.assertFalse(installer_url_allowed("https://example.test/setup.exe"))
+        self.assertFalse(
+            installer_url_allowed(
+                "https://github.com/other-owner/other-repo/releases/download/v9.9.9/SheetDataHub-Setup-v9.9.9.exe"
+            )
+        )
+        self.assertFalse(
+            installer_url_allowed(
+                "https://objects.githubusercontent.com/github-production-release-asset/SheetDataHub-Setup.exe"
+            )
+        )
+        self.assertTrue(
+            installer_final_url_allowed(
+                "https://release-assets.githubusercontent.com/github-production-release-asset/SheetDataHub-Setup.exe"
+            )
+        )
 
         payload = b"MZ" + (b"x" * (1024 * 1024))
 
@@ -151,8 +177,22 @@ class RuleTests(unittest.TestCase):
         ):
             with self.assertRaises(RuntimeError):
                 download_release_installer(info, directory)
+
+        class FakeCdnResponse(FakeDownloadResponse):
+            url = "https://release-assets.githubusercontent.com/github-production-release-asset/SheetDataHub-Setup.exe"
+
+        with tempfile.TemporaryDirectory() as directory, patch(
+            "sheet_hub.version.requests.get", return_value=FakeCdnResponse()
+        ):
+            cdn_path = download_release_installer(info, directory)
+            self.assertEqual(cdn_path.read_bytes()[:2], b"MZ")
         self.assertEqual(info["installer_kind"], "exe")
         self.assertTrue(str(path).endswith(".exe"))
+        too_big = dict(info)
+        too_big["installer_size"] = MAX_INSTALLER_BYTES + 1
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(RuntimeError):
+                download_release_installer(too_big, directory)
 
     def test_update_release_picks_macos_dmg(self):
         assets = [
@@ -203,6 +243,20 @@ class RuleTests(unittest.TestCase):
             path = download_release_installer(info, directory)
             self.assertTrue(str(path).endswith(".dmg"))
             self.assertTrue(path.read_bytes().endswith(b"koly"))
+
+    def test_gspread_client_rejects_non_service_account_json(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "not-sa.json"
+            path.write_text('{"type": "authorized_user", "client_email": "a@b.c"}', encoding="utf-8")
+            with self.assertRaises(FileNotFoundError):
+                SourceReader._gspread_client(str(path))
+            missing = Path(directory) / "missing.json"
+            with self.assertRaises(FileNotFoundError):
+                SourceReader._gspread_client(str(missing))
+            txt = Path(directory) / "keys.txt"
+            txt.write_text("{}", encoding="utf-8")
+            with self.assertRaises(FileNotFoundError):
+                SourceReader._gspread_client(str(txt))
 
     def test_credential_pool_rotates_on_429(self):
         class QuotaError(Exception):
@@ -599,6 +653,8 @@ class DatabaseTests(unittest.TestCase):
             ["状态", "组别", "渠道", "队别", "姓名", "客户名"],
         )
         self.assertEqual(list_name_headers(headers), ["姓名"])
+        self.assertEqual(list_team_headers(headers), ["队别", "组别"])
+        self.assertEqual(pick_header(["日期", "组别", "姓名"], TEAM_HEADER_HINTS), "组别")
         self.assertTrue(is_session_header("第一场"))
         self.assertTrue(is_session_header("第八场"))
         self.assertFalse(is_session_header("市场"))
@@ -647,6 +703,35 @@ class DatabaseTests(unittest.TestCase):
         self.assertEqual(person.scope, "队别 一队 · StaffA")
         self.assertEqual(all_teams_person.current.count, 3)
         self.assertEqual(all_teams_person.scope, "全部队别 · StaffA")
+
+    def test_analyze_can_filter_by_group_column(self):
+        records = [
+            Record("s", "源", "g", "表", 2, {"组别": "一组", "报名日期": "2026-10-05", "姓名": "Alpha"}, "a"),
+            Record("s", "源", "g", "表", 3, {"组别": "二组", "报名日期": "2026-10-06", "姓名": "Beta"}, "b"),
+            Record("s", "源", "g", "表", 4, {"组别": "一组", "报名日期": "2026-10-06", "姓名": "Alpha"}, "c"),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            engine = DataEngine(store)
+            engine.database.replace_all(records)
+            result = engine.analyze(
+                source="aggregate",
+                team_field="组别",
+                team="一组",
+                compare_mode="week",
+                compare=False,
+                reference_date=date(2026, 10, 6),
+            )
+            engine.cache.replace(
+                "src",
+                records + [Record("src", "源", "g", "表", 5, {"组别": "Grupo"}, "d")],
+                ["组别", "报名日期", "姓名"],
+            )
+            teams = engine.list_analysis_teams("src", "组别")
+        self.assertEqual(result.team_field, "组别")
+        self.assertEqual(result.current.count, 2)
+        self.assertEqual(result.scope, "队别 一组 · 整个队别")
+        self.assertEqual(teams, ["一组", "二组"])
 
     def test_analyze_uses_selected_date_column(self):
         records = [

@@ -71,7 +71,8 @@ RANGE_MODE_ALIASES = {
     "last2": "days2",
 }
 DATE_HEADER_HINTS = ("日期", "时间", "date", "datetime")
-TEAM_HEADER_HINTS = ("队别", "队伍", "团队", "战队")
+TEAM_HEADER_HINTS = ("队别", "队伍", "团队", "战队", "组别", "分组", "grupo")
+TEAM_VALUE_SKIP = ("grupo", "qual o grupo", "队别", "组别", "分组", "摸底组别")
 NAME_HEADER_HINTS = ("摸底/推广", "摸底人员", "推广人员", "人员", "姓名", "名字")
 NAME_HEADER_SKIP = ("线索",)
 SESSION_HEADER_HINTS = ("场",)
@@ -131,6 +132,10 @@ def cell_has_d(value: str) -> bool:
 
 def list_name_headers(headers: list[str]) -> list[str]:
     return list_matching_headers(headers, NAME_HEADER_HINTS)
+
+
+def list_team_headers(headers: list[str]) -> list[str]:
+    return list_matching_headers(headers, TEAM_HEADER_HINTS)
 
 
 def list_chart_headers(headers: list[str]) -> list[str]:
@@ -895,12 +900,15 @@ class DataEngine:
         return list_matching_headers(headers, DATE_HEADER_HINTS)
 
     def list_name_headers(self, headers: list[str]) -> list[str]:
-        return list_matching_headers(headers, NAME_HEADER_HINTS)
+        return list_name_headers(headers)
+
+    def list_team_headers(self, headers: list[str]) -> list[str]:
+        return list_team_headers(headers)
 
     def list_analysis_teams(self, source_id: str, team_field: str) -> list[str]:
         if not source_id.strip() or not str(team_field or "").strip() or not self.cache.has(source_id):
             return []
-        skip = {str(team_field).strip().casefold(), "grupo"}
+        skip = {str(team_field).strip().casefold(), *TEAM_VALUE_SKIP}
         seen: set[str] = set()
         values: list[str] = []
         for record in self.cache.load(source_id):

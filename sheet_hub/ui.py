@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
     QComboBox,
+    QCompleter,
     QDateEdit,
     QDialog,
     QDialogButtonBox,
@@ -624,10 +625,18 @@ class MainWindow(QMainWindow):
         self.analysis_date_field.setMinimumWidth(130)
         self.analysis_name_field = QComboBox()
         self.analysis_name_field.setMinimumWidth(130)
+        self.analysis_team_field = QComboBox()
+        self.analysis_team_field.setMinimumWidth(110)
         self.analysis_team = QComboBox()
         self.analysis_team.setEditable(True)
         self.analysis_team.setInsertPolicy(QComboBox.NoInsert)
-        self.analysis_team.setMinimumWidth(120)
+        self.analysis_team.setMinimumWidth(140)
+        self.analysis_team.setMaxVisibleItems(16)
+        team_completer = QCompleter(self.analysis_team.model(), self.analysis_team)
+        team_completer.setCaseSensitivity(Qt.CaseInsensitive)
+        team_completer.setFilterMode(Qt.MatchContains)
+        team_completer.setCompletionMode(QCompleter.PopupCompletion)
+        self.analysis_team.setCompleter(team_completer)
         self.analysis_names = QLineEdit(str(self.store.get("analysis_names", "") or ""))
         self.analysis_names.setPlaceholderText("留空=整个队别")
         self.analysis_exclude = QLineEdit(str(self.store.get("analysis_exclude_keywords", "") or ""))
@@ -646,6 +655,8 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.analysis_date_field)
         bar.addWidget(QLabel("名字列"))
         bar.addWidget(self.analysis_name_field)
+        bar.addWidget(QLabel("队别列"))
+        bar.addWidget(self.analysis_team_field)
         bar.addWidget(QLabel("队别"))
         bar.addWidget(self.analysis_team)
         bar.addWidget(QLabel("名字"))
@@ -720,6 +731,7 @@ class MainWindow(QMainWindow):
         self.analysis_source_pick.currentIndexChanged.connect(self.on_analysis_table_changed)
         self.analysis_date_field.currentTextChanged.connect(self.persist_workspace_settings)
         self.analysis_name_field.currentTextChanged.connect(self.persist_workspace_settings)
+        self.analysis_team_field.currentTextChanged.connect(self.on_analysis_team_field_changed)
         self.analysis_team.currentTextChanged.connect(self.persist_workspace_settings)
         self.analysis_range.currentIndexChanged.connect(self.sync_analysis_periods)
         self.analysis_range.currentIndexChanged.connect(self.persist_workspace_settings)
@@ -1219,6 +1231,8 @@ class MainWindow(QMainWindow):
             self.store.set("analysis_team", team)
             self.store.set("analysis_date_field", self.analysis_date_field.currentText().strip())
             self.store.set("analysis_name_field", self.analysis_name_field.currentText().strip())
+            if hasattr(self, "analysis_team_field"):
+                self.store.set("analysis_team_field", self.analysis_team_field.currentText().strip())
             self.store.set("analysis_names", self.analysis_names.text().strip())
             self.store.set("analysis_chart_mode", "pie" if self.analysis_chart_pie.isChecked() else "line")
             self.store.set("analysis_stat_headers", self.selected_analysis_headers())
@@ -1493,6 +1507,7 @@ class MainWindow(QMainWindow):
         headers = engine.source_headers(source_id) if source_id else []
         date_headers = engine.list_date_headers(headers)
         name_headers = engine.list_name_headers(headers)
+        team_headers = engine.list_team_headers(headers)
         date_field, team_field, name_field = engine.detect_analysis_fields(headers)
         restoring = self._restoring_settings
         self._restoring_settings = True
@@ -1510,7 +1525,33 @@ class MainWindow(QMainWindow):
             self.analysis_name_field.setCurrentText(saved_name_field)
         elif name_field:
             self.analysis_name_field.setCurrentText(name_field)
+        saved_team_field = self.analysis_team_field.currentText().strip() or str(self.store.get("analysis_team_field", "") or "")
+        self.analysis_team_field.clear()
+        self.analysis_team_field.addItems(team_headers)
+        if saved_team_field in team_headers:
+            self.analysis_team_field.setCurrentText(saved_team_field)
+        elif team_field:
+            self.analysis_team_field.setCurrentText(team_field)
+        self._restoring_settings = restoring
+        self.refresh_analysis_team_values()
+        self.rebuild_analysis_header_checks(headers)
+        self.update_analysis_cache_status()
+
+    def on_analysis_team_field_changed(self) -> None:
+        if getattr(self, "_restoring_settings", False):
+            return
+        self.refresh_analysis_team_values()
+        self.persist_workspace_settings()
+
+    def refresh_analysis_team_values(self) -> None:
+        if not hasattr(self, "analysis_team"):
+            return
+        source_id = self.current_analysis_source_id()
+        team_field = self.analysis_team_field.currentText().strip() if hasattr(self, "analysis_team_field") else ""
+        engine = DataEngine(self.store)
         saved_team = self.current_analysis_team() or str(self.store.get("analysis_team", "") or "")
+        restoring = self._restoring_settings
+        self._restoring_settings = True
         self.analysis_team.clear()
         self.analysis_team.addItem("全部队别")
         teams = engine.list_analysis_teams(source_id, team_field) if source_id and team_field else []
@@ -1524,8 +1565,6 @@ class MainWindow(QMainWindow):
         else:
             self.analysis_team.setCurrentIndex(0)
         self._restoring_settings = restoring
-        self.rebuild_analysis_header_checks(headers)
-        self.update_analysis_cache_status()
 
     def current_analysis_range_mode(self) -> str:
         if not hasattr(self, "analysis_range"):
@@ -1586,12 +1625,14 @@ class MainWindow(QMainWindow):
         self.analysis_summary.setText("正在分析本地库…")
         date_field = self.analysis_date_field.currentText().strip()
         name_field = self.analysis_name_field.currentText().strip()
+        team_field = self.analysis_team_field.currentText().strip() if hasattr(self, "analysis_team_field") else ""
         self.run_task(
             lambda: engine.analyze(
                 source="direct",
                 source_id=source_id,
                 date_field=date_field,
                 name_field=name_field,
+                team_field=team_field,
                 team=team,
                 names=names,
                 exclude_keywords=split_names(self.analysis_exclude.text()),
@@ -2461,17 +2502,24 @@ class MainWindow(QMainWindow):
             task.deleteLater()
             installer = Path(str(path)).resolve()
             updates = (self.store.data_dir / "updates").resolve()
-            if installer.parent != updates:
+            if installer.parent != updates or not installer.is_file():
                 QMessageBox.critical(self, "更新失败", "安装包路径不在本机更新目录，已拒绝启动。")
                 return
             suffix = installer.suffix.casefold()
+            windows = sys.platform.startswith("win")
+            if windows and suffix != ".exe":
+                QMessageBox.critical(self, "更新失败", "当前系统只接受 Windows 安装程序。")
+                return
+            if (not windows) and suffix not in {".dmg", ".zip"}:
+                QMessageBox.critical(self, "更新失败", "当前系统只接受 macOS 安装盘。")
+                return
             if suffix == ".exe":
                 QMessageBox.information(self, "下载完成", "安装包已下载，将关闭当前软件并启动安装程序。")
                 subprocess.Popen([str(installer)], cwd=str(installer.parent))
                 QApplication.quit()
                 return
+            subprocess.Popen(["open", str(installer)], cwd=str(installer.parent))
             if suffix == ".dmg":
-                subprocess.Popen(["open", str(installer)], cwd=str(installer.parent))
                 self.statusBar().showMessage("安装盘已打开", 8000)
                 QMessageBox.information(
                     self,
@@ -2479,10 +2527,6 @@ class MainWindow(QMainWindow):
                     "安装盘已打开。请把应用拖到「应用程序」文件夹，然后重新打开软件。",
                 )
                 return
-            if sys.platform == "darwin":
-                subprocess.Popen(["open", str(installer)], cwd=str(installer.parent))
-            else:
-                subprocess.Popen([str(installer)], cwd=str(installer.parent))
             QMessageBox.information(self, "下载完成", "安装包已下载并打开。")
 
         def failed(message: str) -> None:
