@@ -48,7 +48,7 @@ python app.py
 | `SheetDataHub-macos-arm64-v1.4.3.dmg` | macOS 安装盘：打开后把 `SheetDataHub.app` 拖进「应用程序」 |
 | `SheetDataHub-macos-arm64-v1.4.3.zip` | macOS 便携包 |
 
-系统要求：Windows 10 / 11（64 位），或 macOS 12+（Apple Silicon）。macOS 安装盘由 CI 使用 Developer ID 签名并公证。
+系统要求：Windows 10 / 11（64 位），或 macOS 12+（Apple Silicon）。配置 Developer ID 证书后，CI 会签名并公证安装盘；未配置时 Mac 需按住 Control 单击再打开。
 
 ## 验证软件来源
 
@@ -122,7 +122,7 @@ git push origin v1.0.1
 
 推送后，GitHub Actions 会自动执行以下操作：
 1. 构建项目
-2. 用 Developer ID 签名并公证 macOS 安装盘
+2. 若已配置 Developer ID Secrets，则签名并公证 macOS 安装盘；否则打出未签名包
 3. 生成安全签名（Attestation）
 4. 创建 Release 并上传构建产物
 

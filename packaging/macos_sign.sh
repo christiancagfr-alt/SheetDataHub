@@ -150,23 +150,35 @@ package_zip() {
 package_dmg() {
   local stage="$WORKDIR/dmg_stage"
   local dmg_path="$OUT/SheetDataHub-macos-arm64-v${VERSION}.dmg"
+  local sign_dmg="${1:-}"
   rm -rf "$stage"
   mkdir -p "$stage"
   ditto "$APP" "$stage/SheetDataHub.app"
   ln -s /Applications "$stage/Applications"
   rm -f "$dmg_path"
   hdiutil create -volname "SheetDataHub ${VERSION}" -srcfolder "$stage" -ov -format UDZO "$dmg_path" >/dev/null
-  codesign --force --timestamp --sign "$IDENTITY" "$dmg_path" >/dev/null
+  if [[ -n "$sign_dmg" ]]; then
+    codesign --force --timestamp --sign "$IDENTITY" "$dmg_path" >/dev/null
+  fi
   printf '%s' "$dmg_path"
 }
 
-if [[ -n "${MACOS_CERTIFICATE_P12_BASE64:-}" ]]; then
-  import_certificate
-elif [[ -n "${GITHUB_ACTIONS:-}" ]]; then
-  die "MACOS_CERTIFICATE_P12_BASE64 secret is missing"
-else
-  log "No P12 in environment; using identities already in the keychain"
+emit_unsigned() {
+  log "WARNING: building unsigned macOS packages. Gatekeeper will require Control-click to open."
+  ZIP_PATH="$(package_zip)"
+  sha256_file "$ZIP_PATH"
+  DMG_PATH="$(package_dmg)"
+  sha256_file "$DMG_PATH"
+  log "Created unsigned $ZIP_PATH"
+  log "Created unsigned $DMG_PATH"
+}
+
+if [[ -z "${MACOS_CERTIFICATE_P12_BASE64:-}" ]]; then
+  emit_unsigned
+  exit 0
 fi
+
+import_certificate
 IDENTITY="$(resolve_identity)"
 write_api_key
 sign_app
@@ -177,7 +189,7 @@ xcrun stapler staple "$APP"
 ZIP_PATH="$(package_zip)"
 sha256_file "$ZIP_PATH"
 
-DMG_PATH="$(package_dmg)"
+DMG_PATH="$(package_dmg sign)"
 notarize "$DMG_PATH"
 xcrun stapler staple "$DMG_PATH"
 sha256_file "$DMG_PATH"
