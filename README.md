@@ -43,21 +43,21 @@ python app.py
 
 | 文件 | 说明 |
 |------|------|
-| `SheetDataHub-Setup-v1.4.2.exe` | Windows 安装程序（推荐） |
-| `SheetDataHub-windows-v1.4.2.zip` | Windows 免安装便携包，解压后运行 `SheetDataHub/SheetDataHub.exe` |
-| `SheetDataHub-macos-arm64-v1.4.2.dmg` | macOS 安装盘：打开后把 `SheetDataHub.app` 拖进「应用程序」 |
-| `SheetDataHub-macos-arm64-v1.4.2.zip` | macOS 便携包 |
+| `SheetDataHub-Setup-v1.4.3.exe` | Windows 安装程序（推荐） |
+| `SheetDataHub-windows-v1.4.3.zip` | Windows 免安装便携包，解压后运行 `SheetDataHub/SheetDataHub.exe` |
+| `SheetDataHub-macos-arm64-v1.4.3.dmg` | macOS 安装盘：打开后把 `SheetDataHub.app` 拖进「应用程序」 |
+| `SheetDataHub-macos-arm64-v1.4.3.zip` | macOS 便携包 |
 
-系统要求：Windows 10 / 11（64 位），或 macOS 12+（Apple Silicon）。Mac 若提示无法打开，按住 Control 单击图标再选打开。
+系统要求：Windows 10 / 11（64 位），或 macOS 12+（Apple Silicon）。macOS 安装盘由 CI 使用 Developer ID 签名并公证。
 
 ## 验证软件来源
 
 下载后，使用 GitHub CLI 验证文件确实由官方 CI 构建、且未被篡改：
 
 ```bash
-gh attestation verify ./SheetDataHub-windows-v1.4.2.zip --repo christiancagfr-alt/SheetDataHub
-gh attestation verify ./SheetDataHub-Setup-v1.4.2.exe --repo christiancagfr-alt/SheetDataHub
-gh attestation verify ./SheetDataHub-macos-arm64-v1.4.2.dmg --repo christiancagfr-alt/SheetDataHub
+gh attestation verify ./SheetDataHub-windows-v1.4.3.zip --repo christiancagfr-alt/SheetDataHub
+gh attestation verify ./SheetDataHub-Setup-v1.4.3.exe --repo christiancagfr-alt/SheetDataHub
+gh attestation verify ./SheetDataHub-macos-arm64-v1.4.3.dmg --repo christiancagfr-alt/SheetDataHub
 ```
 
 验证成功表示该软件确实由官方 GitHub Actions 构建。
@@ -122,8 +122,29 @@ git push origin v1.0.1
 
 推送后，GitHub Actions 会自动执行以下操作：
 1. 构建项目
-2. 生成安全签名（Attestation）
-3. 创建 Release 并上传构建产物
+2. 用 Developer ID 签名并公证 macOS 安装盘
+3. 生成安全签名（Attestation）
+4. 创建 Release 并上传构建产物
+
+### macOS 签名 Secrets
+
+发布 macOS 包需要 Apple Developer Program 的 **Developer ID Application** 证书，以及 App Store Connect API 密钥。在个人仓库 `christiancagfr-alt/SheetDataHub` 的 Settings → Secrets and variables → Actions 中添加：
+
+| Secret | 内容 |
+|--------|------|
+| `MACOS_CERTIFICATE_P12_BASE64` | Developer ID Application 的 `.p12` 做 Base64 |
+| `MACOS_CERTIFICATE_PASSWORD` | 导出该 `.p12` 时设置的密码 |
+| `MACOS_CODESIGN_IDENTITY` | 可选。例如 `Developer ID Application: 名称 (TEAMID)`。留空则自动识别 |
+| `APPLE_API_KEY_P8_BASE64` | App Store Connect API 的 `.p8` 做 Base64 |
+| `APPLE_API_KEY_ID` | API Key ID |
+| `APPLE_API_ISSUER` | Issuer ID（UUID） |
+
+Windows 上可以把文件转成 Base64 后写入 Secret：
+
+```powershell
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("证书.p12"))
+[Convert]::ToBase64String([IO.File]::ReadAllBytes("AuthKey_XXXXXX.p8"))
+```
 
 #### 4. 查看构建结果
 

@@ -64,7 +64,8 @@ if sys.platform == 'darwin':
             'NSHighResolutionCapable': True,
             'CFBundleDisplayName': '表数通',
             'CFBundleName': 'SheetDataHub',
-            'CFBundleShortVersionString': '1.4.2',
+            'CFBundleShortVersionString': '1.4.3',
+            'CFBundleVersion': '1.4.3',
             'LSMinimumSystemVersion': '12.0',
         },
     )

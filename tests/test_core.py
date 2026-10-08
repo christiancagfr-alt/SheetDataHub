@@ -58,6 +58,20 @@ from sheet_hub.version import (
 
 
 class RuleTests(unittest.TestCase):
+    def test_macos_entitlements_and_sign_script_exist(self):
+        root = Path(__file__).resolve().parents[1]
+        entitlements = (root / "packaging" / "macos_entitlements.plist").read_text(encoding="utf-8")
+        script = (root / "packaging" / "macos_sign.sh").read_text(encoding="utf-8")
+        workflow = (root / ".github" / "workflows" / "release.yml").read_text(encoding="utf-8")
+        self.assertIn("com.apple.security.cs.allow-jit", entitlements)
+        self.assertIn("com.apple.security.cs.allow-unsigned-executable-memory", entitlements)
+        self.assertIn("com.apple.security.cs.disable-library-validation", entitlements)
+        self.assertIn("Developer ID Application", script)
+        self.assertIn("notarytool", script)
+        self.assertIn("macos_sign.sh", workflow)
+        self.assertIn("MACOS_CERTIFICATE_P12_BASE64", workflow)
+        self.assertIn("APPLE_API_KEY_P8_BASE64", workflow)
+
     def test_google_download_host_allowlist(self):
         self.assertTrue(_google_download_host_ok("https://docs.google.com/spreadsheets/d/abc/export?format=xlsx"))
         self.assertTrue(_google_download_host_ok("https://doc-00-00-docs.googleusercontent.com/file"))

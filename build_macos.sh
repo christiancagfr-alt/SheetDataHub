@@ -9,23 +9,9 @@ if [[ -d dist-onedir/SheetDataHub.app ]]; then
   APP="dist-onedir/SheetDataHub.app"
 elif [[ -d dist-onedir/SheetDataHub/SheetDataHub.app ]]; then
   APP="dist-onedir/SheetDataHub/SheetDataHub.app"
-elif [[ -d dist-onedir/SheetDataHub ]]; then
-  APP="dist-onedir/SheetDataHub"
 else
-  echo "macOS build output missing"
+  echo "macOS .app bundle missing"
   exit 1
 fi
-ZIP="dist/release/SheetDataHub-macos-arm64-v${VERSION}.zip"
-ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
-shasum -a 256 "$ZIP" | awk '{print $1}' > "${ZIP}.sha256"
-echo "Created $ZIP"
-STAGE="dist/dmg_stage"
-rm -rf "$STAGE"
-mkdir -p "$STAGE"
-ditto "$APP" "$STAGE/SheetDataHub.app"
-ln -s /Applications "$STAGE/Applications"
-DMG="dist/release/SheetDataHub-macos-arm64-v${VERSION}.dmg"
-hdiutil create -volname "SheetDataHub ${VERSION}" -srcfolder "$STAGE" -ov -format UDZO "$DMG"
-shasum -a 256 "$DMG" | awk '{print $1}' > "${DMG}.sha256"
-rm -rf "$STAGE"
-echo "Created $DMG"
+bash packaging/macos_sign.sh --app "$APP" --version "$VERSION" --out dist/release
+echo "Signed and notarized macOS packages in dist/release"

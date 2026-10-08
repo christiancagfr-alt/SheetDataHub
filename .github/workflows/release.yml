@@ -142,37 +142,32 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           python -m pip install -r requirements.txt pyinstaller
-      - name: Build macOS app
+      - name: Build, sign, and notarize macOS app
+        env:
+          MACOS_CERTIFICATE_P12_BASE64: ${{ secrets.MACOS_CERTIFICATE_P12_BASE64 }}
+          MACOS_CERTIFICATE_PASSWORD: ${{ secrets.MACOS_CERTIFICATE_PASSWORD }}
+          MACOS_CODESIGN_IDENTITY: ${{ secrets.MACOS_CODESIGN_IDENTITY }}
+          APPLE_API_KEY_P8_BASE64: ${{ secrets.APPLE_API_KEY_P8_BASE64 }}
+          APPLE_API_KEY_ID: ${{ secrets.APPLE_API_KEY_ID }}
+          APPLE_API_ISSUER: ${{ secrets.APPLE_API_ISSUER }}
         run: |
           set -euo pipefail
           VERSION="${{ needs.resolve.outputs.version }}"
           python -m PyInstaller --noconfirm --clean --distpath dist-onedir SheetDataHub.spec
-          mkdir -p release-assets dist/release
+          mkdir -p release-assets
           APP=""
           if [[ -d dist-onedir/SheetDataHub.app ]]; then
             APP="dist-onedir/SheetDataHub.app"
           elif [[ -d dist-onedir/SheetDataHub/SheetDataHub.app ]]; then
             APP="dist-onedir/SheetDataHub/SheetDataHub.app"
-          elif [[ -d dist-onedir/SheetDataHub ]]; then
-            APP="dist-onedir/SheetDataHub"
           fi
           if [[ -z "$APP" ]]; then
-            echo "ERROR: macOS build output not found"
+            echo "ERROR: macOS .app bundle not found"
             ls -laR dist-onedir || true
             exit 1
           fi
-          ZIP="release-assets/SheetDataHub-macos-arm64-v${VERSION}.zip"
-          ditto -c -k --sequesterRsrc --keepParent "$APP" "$ZIP"
-          shasum -a 256 "$ZIP" | awk '{print $1}' > "${ZIP}.sha256"
-          STAGE="dist/dmg_stage"
-          rm -rf "$STAGE"
-          mkdir -p "$STAGE"
-          ditto "$APP" "$STAGE/SheetDataHub.app"
-          ln -s /Applications "$STAGE/Applications"
-          DMG="release-assets/SheetDataHub-macos-arm64-v${VERSION}.dmg"
-          hdiutil create -volname "SheetDataHub ${VERSION}" -srcfolder "$STAGE" -ov -format UDZO "$DMG"
-          shasum -a 256 "$DMG" | awk '{print $1}' > "${DMG}.sha256"
-          rm -rf "$STAGE"
+          chmod +x packaging/macos_sign.sh
+          bash packaging/macos_sign.sh --app "$APP" --version "$VERSION" --out release-assets
           ls -la release-assets
       - name: Attest macOS artifacts
         uses: actions/attest-build-provenance@e8998f949152b193b063cb0ec769d69d929409be

@@ -26,3 +26,6 @@ credentials.json
 *.local.json
 *.sqlite
 docs-local/
+*.p12
+*.p8
+AuthKey_*.p8

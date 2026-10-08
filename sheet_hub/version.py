@@ -9,7 +9,7 @@ from urllib.parse import urlparse
 import requests
 
 
-APP_VERSION = "1.4.2"
+APP_VERSION = "1.4.3"
 UPDATE_REPO = "christiancagfr-alt/SheetDataHub"
 RELEASES_URL = f"https://github.com/{UPDATE_REPO}/releases"
 INSTALLER_DOWNLOAD_PREFIX = f"https://github.com/{UPDATE_REPO}/releases/download/"
