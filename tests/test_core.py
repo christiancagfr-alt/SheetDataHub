@@ -8,6 +8,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import openpyxl
+from PySide6.QtCore import QEvent, Qt
+from PySide6.QtGui import QKeyEvent
+from PySide6.QtWidgets import QApplication, QAbstractItemView
 
 from sheet_hub.config_store import ConfigStore
 from sheet_hub.database import AggregateDatabase, SourceCache
@@ -41,7 +44,7 @@ from sheet_hub.source_reader import (
     google_retry,
     parse_schema_lines,
 )
-from sheet_hub.ui import DEFAULT_QUERY_RESULT_FIELDS, is_phone_data_table, query_result_headers
+from sheet_hub.ui import DEFAULT_QUERY_RESULT_FIELDS, QueryResultTable, is_phone_data_table, query_result_headers
 from sheet_hub.version import (
     APP_VERSION,
     MAX_INSTALLER_BYTES,
@@ -58,6 +61,23 @@ from sheet_hub.version import (
 
 
 class RuleTests(unittest.TestCase):
+    def test_query_table_ctrl_c_uses_whole_row_copy_handler(self):
+        app = QApplication.instance() or QApplication([])
+        table = QueryResultTable()
+        table.setColumnCount(2)
+        table.setRowCount(2)
+        table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        table.selectRow(0)
+        copied = []
+        table.copy_rows_requested.connect(lambda: copied.append(True))
+
+        table.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_C, Qt.ControlModifier))
+
+        self.assertEqual(copied, [True])
+        table.deleteLater()
+        app.processEvents()
+
     def test_macos_entitlements_and_sign_script_exist(self):
         root = Path(__file__).resolve().parents[1]
         entitlements = (root / "packaging" / "macos_entitlements.plist").read_text(encoding="utf-8")

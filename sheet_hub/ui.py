@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Callable
 
 from PySide6.QtCore import QDate, QPoint, QPointF, QRect, QThread, QTimer, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QFontDatabase, QFontMetrics, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtGui import QColor, QFont, QFontDatabase, QFontMetrics, QIcon, QKeySequence, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -76,6 +76,17 @@ DEFAULT_QUERY_RESULT_FIELDS = ["输入电话号码", "专页ID", "姓名", "评�
 PHONE_HEADERS = {"号码", "手机号", "手机号码", "电话", "联系电话", "phone", "number"}
 PHONE_TABLE_NAME_HINTS = ("号码表", "号码数据")
 PAGE_ID_HEADERS = {"专页id", "pageid"}
+
+
+class QueryResultTable(QTableWidget):
+    copy_rows_requested = Signal()
+
+    def keyPressEvent(self, event) -> None:
+        if event.matches(QKeySequence.StandardKey.Copy):
+            self.copy_rows_requested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
 
 def is_phone_data_table(fields: list[str] | None = None, source_name: str = "") -> bool:
@@ -565,6 +576,10 @@ class MainWindow(QMainWindow):
         self.copy_query_button = QPushButton("一键复制结果")
         self.copy_query_button.setEnabled(False)
         self.copy_query_button.clicked.connect(self.copy_query_results)
+        self.copy_selected_query_button = QPushButton("复制选中行")
+        self.copy_selected_query_button.setEnabled(False)
+        self.copy_selected_query_button.setToolTip("选择一行或多行后复制；也可在结果表中按 Ctrl+C")
+        self.copy_selected_query_button.clicked.connect(self.copy_selected_query_rows)
         bar.addWidget(QLabel("表格来源"))
         bar.addWidget(self.query_mode)
         bar.addWidget(self.query_table_label)
@@ -576,7 +591,6 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.query_fuzzy)
         bar.addWidget(self.refresh_cache_button)
         bar.addWidget(button)
-        bar.addWidget(self.copy_query_button)
         date_bar = QHBoxLayout()
         date_bar.addWidget(self.query_date_enabled)
         date_bar.addWidget(QLabel("日期字段"))
@@ -592,9 +606,14 @@ class MainWindow(QMainWindow):
         self.query_exclude.editingFinished.connect(self.persist_workspace_settings)
         date_bar.addWidget(self.query_exclude, 1)
         date_bar.addStretch()
-        self.query_table = QTableWidget()
+        self.query_table = QueryResultTable()
         self.query_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.query_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.query_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        self.query_table.itemSelectionChanged.connect(
+            lambda: self.copy_selected_query_button.setEnabled(bool(self.query_table.selectionModel().selectedRows()))
+        )
+        self.query_table.copy_rows_requested.connect(self.copy_selected_query_rows)
         self.query_table.verticalHeader().setVisible(False)
         self.query_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         hint = QLabel("其他表即使查询号码字段，也按该表表头显示。只有号码数据表才显示修正格式，并提供“复制号码和修正格式”。")
@@ -607,6 +626,11 @@ class MainWindow(QMainWindow):
         self.query_cache_status.setObjectName("muted")
         layout.addLayout(bar)
         layout.addLayout(date_bar)
+        copy_bar = QHBoxLayout()
+        copy_bar.addWidget(self.copy_query_button)
+        copy_bar.addWidget(self.copy_selected_query_button)
+        copy_bar.addStretch()
+        layout.addLayout(copy_bar)
         layout.addWidget(hint)
         layout.addWidget(self.query_cache_status)
         layout.addWidget(self.query_result_summary)
@@ -2273,6 +2297,22 @@ class MainWindow(QMainWindow):
         text_rows = rows if headers else [[str(item) for item in row] for row in rows]
         QApplication.clipboard().setText("\n".join("\t".join(row) for row in text_rows))
         self.statusBar().showMessage(f"已复制 {max(0, len(body))} 行当前表头结果", 5000)
+
+    def copy_selected_query_rows(self) -> None:
+        selected = self.query_table.selectionModel().selectedRows()
+        row_indexes = sorted({index.row() for index in selected})
+        if not row_indexes:
+            return
+        column_count = self.query_table.columnCount()
+        lines = []
+        for row in row_indexes:
+            values = []
+            for column in range(column_count):
+                item = self.query_table.item(row, column)
+                values.append(item.text() if item is not None else "")
+            lines.append("\t".join(values))
+        QApplication.clipboard().setText("\n".join(lines))
+        self.statusBar().showMessage(f"已复制选中 {len(row_indexes)} 行", 5000)
 
     def choose_output(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "保存提取结果", self.output_path.text(), "Excel 工作簿 (*.xlsx)")
