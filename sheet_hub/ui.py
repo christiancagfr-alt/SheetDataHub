@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QStackedWidget,
+    QTabWidget,
     QTableWidget,
     QTableWidgetItem,
     QTextEdit,
@@ -50,6 +51,7 @@ from .engine import COMPARE_MODES, DataEngine, compare_periods, is_session_heade
 from .models import AnalysisResult, Record, SourceConfig
 from .source_reader import (
     SourceReader,
+    choose_sheets,
     excel_column,
     normalize_column_schema,
     schema_field_names,
@@ -87,6 +89,10 @@ class QueryResultTable(QTableWidget):
             event.accept()
             return
         super().keyPressEvent(event)
+
+
+def active_query_excludes(enabled: bool, text: str) -> list[str]:
+    return split_names(text) if enabled else []
 
 
 def is_phone_data_table(fields: list[str] | None = None, source_name: str = "") -> bool:
@@ -386,7 +392,7 @@ class MainWindow(QMainWindow):
         brand_row.addLayout(brand_text, 1)
         self.nav = QListWidget()
         self.nav.setObjectName("navigation")
-        self.nav.addItems(["数据源", "汇总同步", "数据查询", "数据分析", "时间提取", "字段配置", "运行日志", "设置"])
+        self.nav.addItems(["数据源", "提交与匹配", "汇总同步", "数据查询", "数据分析", "时间提取", "字段配置", "运行日志", "设置"])
         self.nav.setCurrentRow(0)
         sidebar_layout.addLayout(brand_row)
         sidebar_layout.addSpacing(22)
@@ -399,6 +405,7 @@ class MainWindow(QMainWindow):
         sidebar_layout.addWidget(self.sidebar_update_button)
         self.pages = QStackedWidget()
         self.pages.addWidget(self._sources_page())
+        self.pages.addWidget(self._linked_page())
         self.pages.addWidget(self._sync_page())
         self.pages.addWidget(self._query_page())
         self.pages.addWidget(self._analysis_page())
@@ -456,6 +463,148 @@ class MainWindow(QMainWindow):
         layout.addLayout(actions)
         layout.addWidget(self.source_table, 1)
         layout.addWidget(rule)
+        return page
+
+    def _linked_page(self) -> QWidget:
+        page, layout = self._page(
+            "提交与匹配",
+            "先按数据源表头提交到数据表，再使用同一个数据表匹配并写回指定列。",
+        )
+        repository = QFrame()
+        repository.setObjectName("card")
+        repository_form = QFormLayout(repository)
+        self.linked_data_url = QLineEdit(str(self.store.get("linked_data_url", "") or ""))
+        self.linked_data_url.setPlaceholderText("Google 数据表链接")
+        self.linked_data_sheet = QLineEdit(str(self.store.get("linked_data_sheet", "data") or "data"))
+        repository_form.addRow("联动数据表", self.linked_data_url)
+        repository_form.addRow("数据工作表", self.linked_data_sheet)
+        repository_hint = QLabel("提交数据写入这里；匹配功能自动从这里读取。每次提交和匹配的汇报会写入同一表格的“运行日志”Sheet，最新记录在第 2 行。")
+        repository_hint.setObjectName("muted")
+        repository_form.addRow("", repository_hint)
+        layout.addWidget(repository)
+
+        tabs = QTabWidget()
+        submit_tab = QWidget()
+        submit_layout = QVBoxLayout(submit_tab)
+        submit_form = QFormLayout()
+        self.linked_submit_source = QComboBox()
+        self.linked_submit_sheet = QComboBox()
+        self.linked_submit_sheet.setEditable(True)
+        self.linked_submit_scan = QPushButton("读取 Sheet 与字段")
+        submit_sheet_row = QHBoxLayout()
+        submit_sheet_row.addWidget(self.linked_submit_sheet, 1)
+        submit_sheet_row.addWidget(self.linked_submit_scan)
+        self.linked_submit_id_field = QComboBox()
+        self.linked_submit_name_field = QComboBox()
+        self.linked_submit_date_field = QComboBox()
+        for combo in (
+            self.linked_submit_id_field, self.linked_submit_name_field,
+            self.linked_submit_date_field,
+        ):
+            combo.setEditable(True)
+        self.linked_submitter = QLineEdit(str(self.store.get("linked_submitter", "") or ""))
+        self.linked_submitter.setPlaceholderText("谁提交的，就填写谁的名字")
+        submit_form.addRow("提交来源", self.linked_submit_source)
+        submit_form.addRow("来源子 Sheet", submit_sheet_row)
+        submit_form.addRow("源表 ID 字段", self.linked_submit_id_field)
+        submit_form.addRow("源表名字字段", self.linked_submit_name_field)
+        submit_form.addRow("源表日期字段", self.linked_submit_date_field)
+        submit_note_hint = QLabel("固定读取源表 E 列的“插入备注”（不是 E 列显示的文字）")
+        submit_note_hint.setObjectName("muted")
+        submit_form.addRow("源表备注", submit_note_hint)
+        submit_form.addRow("提交人", self.linked_submitter)
+        submit_layout.addLayout(submit_form)
+        submit_hint = QLabel("数据表固定写入：A ID、B 名字、C 日期、D 备注、E 提交人、F 来源表格；按 ID + 日期 + 来源表格排重。")
+        submit_hint.setObjectName("infoBox")
+        submit_layout.addWidget(submit_hint)
+        submit_actions = QHBoxLayout()
+        self.linked_submit_button = QPushButton("提交数据")
+        self.linked_submit_button.setObjectName("primary")
+        self.linked_submit_status = QLabel("等待提交")
+        self.linked_submit_status.setObjectName("muted")
+        submit_actions.addWidget(self.linked_submit_button)
+        submit_actions.addWidget(self.linked_submit_status)
+        submit_actions.addStretch()
+        submit_layout.addLayout(submit_actions)
+        submit_layout.addStretch()
+
+        match_tab = QWidget()
+        match_layout = QVBoxLayout(match_tab)
+        match_form = QFormLayout()
+        self.linked_match_target_source = QComboBox()
+        self.linked_match_target_sheet = QComboBox()
+        self.linked_match_target_sheet.setEditable(True)
+        self.linked_match_scan = QPushButton("读取 Sheet 与字段")
+        match_sheet_row = QHBoxLayout()
+        match_sheet_row.addWidget(self.linked_match_target_sheet, 1)
+        match_sheet_row.addWidget(self.linked_match_scan)
+        self.linked_match_mode = QComboBox()
+        self.linked_match_mode.addItem("普通匹配（从 DJ 起按日期表头）", "normal")
+        self.linked_match_mode.addItem("补课（固定写入 DI）", "makeup")
+        saved_mode = str(self.store.get("linked_match_mode", "normal") or "normal")
+        self.linked_match_mode.setCurrentIndex(max(0, self.linked_match_mode.findData(saved_mode)))
+        saved_date = QDate.fromString(str(self.store.get("linked_match_date", "") or ""), "yyyy-MM-dd")
+        self.linked_match_date = QDateEdit(saved_date if saved_date.isValid() else QDate.currentDate())
+        self.linked_match_date.setCalendarPopup(True)
+        self.linked_match_date.setDisplayFormat("yyyy-MM-dd")
+        self.linked_match_all_dates = QCheckBox("匹配所有日期（遍历 DJ 右侧全部日期列）")
+        self.linked_match_all_dates.setChecked(bool(self.store.get("linked_match_all_dates", False)))
+        self.linked_match_operator = QLineEdit(
+            str(self.store.get("linked_match_operator", "") or "")
+        )
+        self.linked_match_operator.setPlaceholderText("填写本次执行匹配的人员姓名")
+        self.linked_unmatched_value = QLineEdit(str(self.store.get("linked_match_unmatched_value", "") or ""))
+        self.linked_unmatched_value.setPlaceholderText("默认：❌absent")
+        match_form.addRow("写回数据源", self.linked_match_target_source)
+        match_form.addRow("写回子 Sheet", match_sheet_row)
+        match_form.addRow("匹配类型", self.linked_match_mode)
+        match_form.addRow("匹配日期", self.linked_match_date)
+        match_form.addRow("日期范围", self.linked_match_all_dates)
+        match_form.addRow("执行人", self.linked_match_operator)
+        match_form.addRow("未匹配时写入", self.linked_unmatched_value)
+        match_layout.addLayout(match_form)
+        match_hint = QLabel("完全按原代码：联动表固定读取 A=ID、C=写入内容、D=单元格备注；🏠表优先 O、无结果再用 Q，🍓表合并 AB 和 AD。普通匹配从 DJ 起找日期列，补课固定写 DI；从第 3 行重新写入。")
+        match_hint.setObjectName("infoBox")
+        match_layout.addWidget(match_hint)
+        match_actions = QHBoxLayout()
+        self.linked_match_button = QPushButton("开始匹配并写入")
+        self.linked_match_button.setObjectName("primary")
+        self.linked_match_status = QLabel("等待运行")
+        self.linked_match_status.setObjectName("muted")
+        match_actions.addWidget(self.linked_match_button)
+        match_actions.addWidget(self.linked_match_status)
+        match_actions.addStretch()
+        match_layout.addLayout(match_actions)
+        match_layout.addStretch()
+
+        tabs.addTab(submit_tab, "1. 提交数据")
+        tabs.addTab(match_tab, "2. 匹配写入")
+        layout.addWidget(tabs, 1)
+
+        self.linked_submit_source.currentIndexChanged.connect(self.on_linked_submit_source_changed)
+        self.linked_match_target_source.currentIndexChanged.connect(self.on_linked_match_source_changed)
+        self.linked_submit_scan.clicked.connect(lambda: self.scan_linked_source("submit"))
+        self.linked_match_scan.clicked.connect(lambda: self.scan_linked_source("match"))
+        self.linked_submit_button.clicked.connect(self.run_linked_submit)
+        self.linked_match_button.clicked.connect(self.run_linked_match)
+        self.linked_data_url.editingFinished.connect(self.persist_workspace_settings)
+        self.linked_data_sheet.editingFinished.connect(self.persist_workspace_settings)
+        self.linked_submit_sheet.currentTextChanged.connect(self.persist_workspace_settings)
+        for combo in (
+            self.linked_submit_id_field, self.linked_submit_name_field,
+            self.linked_submit_date_field,
+        ):
+            combo.currentTextChanged.connect(self.persist_workspace_settings)
+        self.linked_submitter.editingFinished.connect(self.persist_workspace_settings)
+        self.linked_match_target_sheet.currentTextChanged.connect(self.persist_workspace_settings)
+        self.linked_match_mode.currentIndexChanged.connect(self.persist_workspace_settings)
+        self.linked_match_mode.currentIndexChanged.connect(self.update_linked_match_options)
+        self.linked_match_date.dateChanged.connect(self.persist_workspace_settings)
+        self.linked_match_all_dates.toggled.connect(self.linked_match_date.setDisabled)
+        self.linked_match_all_dates.toggled.connect(self.persist_workspace_settings)
+        self.linked_match_operator.editingFinished.connect(self.persist_workspace_settings)
+        self.linked_unmatched_value.editingFinished.connect(self.persist_workspace_settings)
+        self.update_linked_match_options()
         return page
 
     def _sync_page(self) -> QWidget:
@@ -599,7 +748,12 @@ class MainWindow(QMainWindow):
         date_bar.addWidget(self.query_start_date)
         date_bar.addWidget(QLabel("至"))
         date_bar.addWidget(self.query_end_date)
-        date_bar.addWidget(QLabel("排除关键词"))
+        self.query_exclude_enabled = QCheckBox("排除关键词")
+        self.query_exclude_enabled.setChecked(bool(self.store.get("query_exclude_enabled", False)))
+        self.query_exclude_enabled.setToolTip("勾选后，查询结果中任一列命中下方关键词的整行都会被排除。")
+        self.query_exclude_enabled.toggled.connect(self.persist_workspace_settings)
+        date_bar.addWidget(self.query_exclude_enabled)
+        date_bar.addWidget(QLabel("关键词"))
         self.query_exclude = QLineEdit(str(self.store.get("query_exclude_keywords", "") or ""))
         self.query_exclude.setPlaceholderText("多个用逗号分隔，命中任一则排除")
         self.query_exclude.setMinimumWidth(180)
@@ -1123,6 +1277,7 @@ class MainWindow(QMainWindow):
         self.refresh_extract_source_picker()
         self.refresh_analysis_source_picker()
         self.refresh_sync_source_list()
+        self.refresh_linked_source_pickers()
         if not getattr(self, "_restoring_settings", False):
             self.refresh_query_fields()
             self.refresh_analysis_fields()
@@ -1198,6 +1353,201 @@ class MainWindow(QMainWindow):
                 path += ".xlsx"
             self.sync_local_xlsx.setText(path)
 
+    def _linked_source_by_id(self, source_id: str) -> SourceConfig | None:
+        return next(
+            (source for source in self.store.load_sources() if source.enabled and source.id == source_id),
+            None,
+        )
+
+    def _linked_config_fields(self, source: SourceConfig | None) -> list[str]:
+        if source and source.column_schema_enabled and source.column_schema:
+            return schema_field_names(source.column_schema)
+        return []
+
+    def refresh_linked_source_pickers(self) -> None:
+        if not hasattr(self, "linked_submit_source"):
+            return
+        restoring = self._restoring_settings
+        self._restoring_settings = True
+        sources = [source for source in self.store.load_sources() if source.enabled]
+        pairs = (
+            (self.linked_submit_source, "linked_submit_source_id"),
+            (self.linked_match_target_source, "linked_match_target_source_id"),
+        )
+        for combo, key in pairs:
+            current = combo.currentData()
+            saved = str(self.store.get(key, "") or "")
+            combo.clear()
+            combo.addItem("请选择数据源", "")
+            for source in sources:
+                combo.addItem(source.name, source.id)
+            target = current or saved
+            index = combo.findData(target)
+            combo.setCurrentIndex(index if index >= 0 else 0)
+        self._refresh_linked_sheet_picker("submit")
+        self._refresh_linked_sheet_picker("match")
+        self._restoring_settings = restoring
+
+    def _refresh_linked_sheet_picker(
+        self,
+        role: str,
+        names: list[str] | None = None,
+        selected: str = "",
+    ) -> None:
+        is_submit = role == "submit"
+        source_combo = self.linked_submit_source if is_submit else self.linked_match_target_source
+        sheet_combo = self.linked_submit_sheet if is_submit else self.linked_match_target_sheet
+        source = self._linked_source_by_id(str(source_combo.currentData() or ""))
+        saved_key = "linked_submit_sheet" if is_submit else "linked_match_target_sheet"
+        current = selected or sheet_combo.currentText().strip() or str(self.store.get(saved_key, "") or "")
+        sheet_combo.blockSignals(True)
+        sheet_combo.clear()
+        if is_submit:
+            sheet_combo.addItem("全部可用子 Sheet", "")
+        available = list(names or (source.include_sheets if source else []))
+        for name in available:
+            sheet_combo.addItem(name, name)
+        if current and current != "全部可用子 Sheet":
+            index = sheet_combo.findData(current)
+            if index >= 0:
+                sheet_combo.setCurrentIndex(index)
+            else:
+                sheet_combo.setCurrentText(current)
+        elif is_submit:
+            sheet_combo.setCurrentIndex(0)
+        sheet_combo.setEnabled(source is not None)
+        sheet_combo.blockSignals(False)
+        fields = self._linked_config_fields(source)
+        if is_submit:
+            self._set_linked_submit_fields(fields)
+
+    def on_linked_submit_source_changed(self) -> None:
+        if getattr(self, "_restoring_settings", False):
+            return
+        self._refresh_linked_sheet_picker("submit")
+        self.persist_workspace_settings()
+
+    def on_linked_match_source_changed(self) -> None:
+        if getattr(self, "_restoring_settings", False):
+            return
+        self._refresh_linked_sheet_picker("match")
+        self.persist_workspace_settings()
+
+    def scan_linked_source(self, role: str) -> None:
+        is_submit = role == "submit"
+        source_combo = self.linked_submit_source if is_submit else self.linked_match_target_source
+        sheet_combo = self.linked_submit_sheet if is_submit else self.linked_match_target_sheet
+        button = self.linked_submit_scan if is_submit else self.linked_match_scan
+        source = self._linked_source_by_id(str(source_combo.currentData() or ""))
+        if source is None:
+            QMessageBox.information(self, "请选择", "请先选择一个数据源。")
+            return
+        source = SourceConfig.from_dict(source.to_dict())
+        if not source.credential_path:
+            source.credential_path = str(self.store.get("credential_path", "") or "")
+        requested = sheet_combo.currentText().strip()
+        if requested == "全部可用子 Sheet":
+            requested = ""
+
+        def job():
+            reader = SourceReader(
+                self.store.get("field_aliases", {}),
+                self.store.get("global_excludes", []),
+                column_schema=source.column_schema if source.column_schema_enabled else [],
+            )
+            names = reader.list_sheets(source)
+            excludes = [*self.store.get("global_excludes", []), *source.exclude_sheets]
+            available, _ = choose_sheets(names, [], excludes)
+            chosen = requested if requested in available else (available[0] if available else "")
+            fields = self._linked_config_fields(source)
+            if chosen and not fields:
+                inspect_source = SourceConfig.from_dict(source.to_dict())
+                inspect_source.include_sheets = [chosen]
+                records = reader.read(inspect_source)
+                if records:
+                    fields = list(dict.fromkeys([
+                        *records[0].source_headers,
+                        *records[0].values.keys(),
+                    ]))
+            return {"names": available, "fields": fields, "selected": chosen}
+
+        def done(result: dict[str, object]) -> None:
+            names = list(result.get("names") or [])
+            fields = list(result.get("fields") or [])
+            selected = str(result.get("selected") or "")
+            self._refresh_linked_sheet_picker(role, names, selected)
+            if is_submit:
+                self._set_linked_submit_fields(fields)
+            self.statusBar().showMessage(f"已读取 {len(names)} 个 Sheet、{len(fields)} 个字段", 5000)
+
+        self.run_task(job, done, "正在读取 Sheet 与字段…", button)
+
+    def _set_linked_submit_fields(self, fields: list[str]) -> None:
+        if not hasattr(self, "linked_submit_id_field"):
+            return
+        engine = DataEngine(self.store)
+        combos = (
+            (self.linked_submit_id_field, "linked_submit_id_field", "ID", "ID"),
+            (self.linked_submit_name_field, "linked_submit_name_field", "名字", "名字"),
+            (self.linked_submit_date_field, "linked_submit_date_field", "日期", "日期"),
+        )
+        for combo, setting, fallback, semantic in combos:
+            current = combo.currentText().strip()
+            saved = str(self.store.get(setting, fallback) or fallback)
+            suggested = engine.suggest_field(fields, semantic) if semantic else ""
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItems(fields)
+            combo.setCurrentText(current if current in fields else (saved if saved in fields else suggested or saved))
+            combo.blockSignals(False)
+
+    def run_linked_submit(self) -> None:
+        self.persist_workspace_settings()
+        self.linked_submit_status.setText("正在提交…")
+        engine = DataEngine(self.store)
+        self.run_task(
+            engine.submit_linked_data,
+            self.linked_submit_finished,
+            "正在提交数据…",
+            self.linked_submit_button,
+            lambda message: self.linked_submit_status.setText("已结束：提交失败"),
+        )
+
+    def linked_submit_finished(self, result: dict[str, int]) -> None:
+        log_status = "报告已写入运行日志" if result.get("log_written") else "报告写入失败，请查看本地日志"
+        self.linked_submit_status.setText(
+            f"已结束：读取 {result['read']} 行，写入 {result['written']} 行，跳过 {result['duplicates']} 行；{log_status}"
+        )
+        self.refresh_logs()
+
+    def update_linked_match_options(self) -> None:
+        if not hasattr(self, "linked_match_all_dates"):
+            return
+        normal_mode = (self.linked_match_mode.currentData() or "normal") == "normal"
+        if not normal_mode and self.linked_match_all_dates.isChecked():
+            self.linked_match_all_dates.setChecked(False)
+        self.linked_match_all_dates.setEnabled(normal_mode)
+        self.linked_match_date.setDisabled(normal_mode and self.linked_match_all_dates.isChecked())
+
+    def run_linked_match(self) -> None:
+        self.persist_workspace_settings()
+        self.linked_match_status.setText("正在匹配…")
+        engine = DataEngine(self.store)
+        self.run_task(
+            engine.match_linked_data,
+            self.linked_match_finished,
+            "正在匹配并写入…",
+            self.linked_match_button,
+            lambda message: self.linked_match_status.setText("已结束：匹配失败"),
+        )
+
+    def linked_match_finished(self, result: dict[str, int]) -> None:
+        log_status = "报告已写入运行日志" if result.get("log_written") else "报告写入失败，请查看本地日志"
+        self.linked_match_status.setText(
+            f"已结束：匹配 {result['matched']} 行，未匹配 {result['unmatched']} 行，写入 {result['updated']} 个单元格；{log_status}"
+        )
+        self.refresh_logs()
+
     def run_sync(self) -> None:
         ids = self.selected_sync_source_ids()
         if not ids:
@@ -1252,6 +1602,23 @@ class MainWindow(QMainWindow):
                 self.store.set("query_direct_source_id", self.query_source_pick.currentData() or "")
             if hasattr(self, "query_exclude"):
                 self.store.set("query_exclude_keywords", self.query_exclude.text().strip())
+            self.store.set("query_exclude_enabled", self.query_exclude_enabled.isChecked())
+        if hasattr(self, "linked_data_url"):
+            self.store.set("linked_data_url", self.linked_data_url.text().strip())
+            self.store.set("linked_data_sheet", self.linked_data_sheet.text().strip() or "data")
+            self.store.set("linked_submit_source_id", self.linked_submit_source.currentData() or "")
+            self.store.set("linked_submit_sheet", self.linked_submit_sheet.currentText().strip())
+            self.store.set("linked_submit_id_field", self.linked_submit_id_field.currentText().strip())
+            self.store.set("linked_submit_name_field", self.linked_submit_name_field.currentText().strip())
+            self.store.set("linked_submit_date_field", self.linked_submit_date_field.currentText().strip())
+            self.store.set("linked_submitter", self.linked_submitter.text().strip())
+            self.store.set("linked_match_target_source_id", self.linked_match_target_source.currentData() or "")
+            self.store.set("linked_match_target_sheet", self.linked_match_target_sheet.currentText().strip())
+            self.store.set("linked_match_mode", self.linked_match_mode.currentData() or "normal")
+            self.store.set("linked_match_date", self.linked_match_date.date().toString("yyyy-MM-dd"))
+            self.store.set("linked_match_all_dates", self.linked_match_all_dates.isChecked())
+            self.store.set("linked_match_operator", self.linked_match_operator.text().strip())
+            self.store.set("linked_match_unmatched_value", self.linked_unmatched_value.text())
         if hasattr(self, "analysis_source_pick"):
             self.store.set("analysis_source", "direct")
             self.store.set("analysis_direct_source_id", self.analysis_source_pick.currentData() or "")
@@ -2171,7 +2538,9 @@ class MainWindow(QMainWindow):
         )
         if hasattr(self, "query_result_summary"):
             self.query_result_summary.setText(f"正在查询：输入 {len(values)} 个值…")
-        excludes = split_names(self.query_exclude.text()) if hasattr(self, "query_exclude") else []
+        excludes = active_query_excludes(
+            self.query_exclude_enabled.isChecked(), self.query_exclude.text()
+        ) if hasattr(self, "query_exclude_enabled") else []
         self.run_task(
             lambda: engine.query_many(
                 field, values, source == "direct", exact, source, extract_target, extract_sheet, source_id,
@@ -2721,6 +3090,8 @@ class MainWindow(QMainWindow):
                     self.query_mode.setCurrentIndex(QUERY_SOURCES.index(saved_source))
                 self.query_fuzzy.setChecked(bool(self.store.get("query_fuzzy", False)))
                 self.query_date_enabled.setChecked(bool(self.store.get("query_date_enabled", False)))
+                self.query_exclude_enabled.setChecked(bool(self.store.get("query_exclude_enabled", False)))
+                self.query_exclude.setText(str(self.store.get("query_exclude_keywords", "") or ""))
                 for widget, key in (
                     (self.query_start_date, "query_start_date"),
                     (self.query_end_date, "query_end_date"),
@@ -2728,6 +3099,21 @@ class MainWindow(QMainWindow):
                     saved = QDate.fromString(str(self.store.get(key, "") or ""), "yyyy-MM-dd")
                     if saved.isValid():
                         widget.setDate(saved)
+            if hasattr(self, "linked_data_url"):
+                self.linked_data_url.setText(str(self.store.get("linked_data_url", "") or ""))
+                self.linked_data_sheet.setText(str(self.store.get("linked_data_sheet", "data") or "data"))
+                self.linked_submitter.setText(str(self.store.get("linked_submitter", "") or ""))
+                self.linked_match_operator.setText(str(self.store.get("linked_match_operator", "") or ""))
+                self.linked_unmatched_value.setText(str(self.store.get("linked_match_unmatched_value", "") or ""))
+                mode_index = self.linked_match_mode.findData(str(self.store.get("linked_match_mode", "normal") or "normal"))
+                if mode_index >= 0:
+                    self.linked_match_mode.setCurrentIndex(mode_index)
+                saved_match_date = QDate.fromString(str(self.store.get("linked_match_date", "") or ""), "yyyy-MM-dd")
+                if saved_match_date.isValid():
+                    self.linked_match_date.setDate(saved_match_date)
+                self.linked_match_all_dates.setChecked(bool(self.store.get("linked_match_all_dates", False)))
+                self.refresh_linked_source_pickers()
+                self.update_linked_match_options()
             if hasattr(self, "output_type"):
                 saved_type = str(self.store.get("extract_destination_type", "local") or "local")
                 self.output_type.setCurrentIndex(1 if saved_type == "google" else 0)

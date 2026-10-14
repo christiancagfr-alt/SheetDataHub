@@ -44,7 +44,13 @@ from sheet_hub.source_reader import (
     google_retry,
     parse_schema_lines,
 )
-from sheet_hub.ui import DEFAULT_QUERY_RESULT_FIELDS, QueryResultTable, is_phone_data_table, query_result_headers
+from sheet_hub.ui import (
+    DEFAULT_QUERY_RESULT_FIELDS,
+    QueryResultTable,
+    active_query_excludes,
+    is_phone_data_table,
+    query_result_headers,
+)
 from sheet_hub.version import (
     APP_VERSION,
     MAX_INSTALLER_BYTES,
@@ -61,6 +67,13 @@ from sheet_hub.version import (
 
 
 class RuleTests(unittest.TestCase):
+    def test_query_exclusion_keywords_only_apply_when_enabled(self):
+        self.assertEqual(active_query_excludes(False, "巴西,葡萄牙,专页后台"), [])
+        self.assertEqual(
+            active_query_excludes(True, "巴西,葡萄牙,专页后台"),
+            ["巴西", "葡萄牙", "专页后台"],
+        )
+
     def test_query_table_ctrl_c_uses_whole_row_copy_handler(self):
         app = QApplication.instance() or QApplication([])
         table = QueryResultTable()
@@ -453,6 +466,234 @@ class RuleTests(unittest.TestCase):
 
 
 class DatabaseTests(unittest.TestCase):
+    def test_linked_submit_uses_fixed_columns_submitter_source_and_dedup(self):
+        class FakeHttp:
+            def __init__(self):
+                self.writes = []
+                self.requests = []
+
+            def fetch_sheet_metadata(self, key, params=None):
+                if params and params.get("includeGridData"):
+                    return {"sheets": [{
+                        "properties": {"title": "A"},
+                        "data": [{"startRow": 0, "rowData": [
+                            {},
+                            {"values": [{"note": "旧的插入备注"}]},
+                            {"values": [{"note": "新增的插入备注"}]},
+                        ]}],
+                    }]}
+                return {"sheets": [{"properties": {"sheetId": 1, "title": "data"}}]}
+
+            def values_get(self, key, range_name, params=None):
+                return {"values": [
+                    ["ID", "名字", "日期", "备注", "提交人", "来源表格"],
+                    ["111", "旧数据", "2026-10-14", "旧备注", "小李", "源/A"],
+                ]}
+
+            def values_update(self, key, range_name, params=None, body=None):
+                self.writes.append((range_name, body["values"]))
+
+            def batch_update(self, key, body=None):
+                self.requests.extend(body["requests"])
+
+        class FakeReader:
+            def read(self, source):
+                return [
+                    Record("s", "源", "g", "A", 2, {"编号": "111", "姓名": "重复", "上课日": "2026-10-14", "E列显示值": "173分钟"}, "h1"),
+                    Record("s", "源", "g", "A", 3, {"编号": "222", "姓名": "新增", "上课日": "2026-10-14", "E列显示值": "160分钟"}, "h2"),
+                ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            store.save_source(SourceConfig("s", "源", "https://docs.google.com/spreadsheets/d/sourceabcdefghijkl", credential_path="fake.json"))
+            store.set("linked_submit_source_id", "s")
+            store.set("linked_data_url", "https://docs.google.com/spreadsheets/d/targetabcdefghijkl")
+            store.set("linked_data_sheet", "data")
+            store.set("linked_submit_id_field", "编号")
+            store.set("linked_submit_name_field", "姓名")
+            store.set("linked_submit_date_field", "上课日")
+            store.set("linked_submitter", "小王")
+            engine = DataEngine(store)
+            http = FakeHttp()
+            with patch.object(engine, "_reader", return_value=FakeReader()), patch.object(
+                SourceReader, "_gspread_client", return_value=SimpleNamespace(http_client=http)
+            ):
+                result = engine.submit_linked_data()
+        self.assertEqual(result, {"read": 2, "written": 1, "duplicates": 1, "log_written": 1})
+        self.assertIn(("'data'!A3", [["222", "新增", "2026-10-14", "新增的插入备注", "小王", "源/A"]]), http.writes)
+        compact = next(request["repeatCell"] for request in http.requests if "repeatCell" in request)
+        self.assertEqual(compact["range"]["sheetId"], 1)
+        self.assertEqual(compact["range"]["startRowIndex"], 1)
+        self.assertEqual(compact["cell"]["userEnteredFormat"]["wrapStrategy"], "CLIP")
+        row_size = next(
+            request["updateDimensionProperties"]
+            for request in http.requests
+            if request.get("updateDimensionProperties", {}).get("range", {}).get("dimension") == "ROWS"
+        )
+        self.assertEqual(row_size["properties"]["pixelSize"], 21)
+        log_write = next(values for range_name, values in http.writes if range_name == "'运行日志'!A1")
+        self.assertEqual(log_write[1][1:4], ["提交数据", "成功", "源/A"])
+        self.assertEqual(log_write[1][7:10], ["1", "1", "3"])
+        self.assertEqual(log_write[0][-1], "执行人")
+        self.assertEqual(log_write[1][-1], "小王")
+
+    def test_linked_match_uses_o_first_q_fallback_and_rewrites_dj_date_column(self):
+        class FakeHttp:
+            def __init__(self):
+                self.requests = []
+
+            def values_get(self, key, range_name, params=None):
+                if range_name.endswith("!A:D"):
+                    return {"values": [
+                        ["ID", "名字", "日期", "备注"],
+                        ["111", "甲", "2026-10-14 出勤", "O命中"],
+                        ["111", "甲", "10/14 请假", "第二条"],
+                        ["222", "乙", "2026-10-14 补录", "Q命中"],
+                    ]}
+                headers = [""] * 114
+                headers[113] = "Oct.14"
+                row3 = [""] * 17
+                row3[14], row3[16] = "111", "222"
+                row4 = [""] * 17
+                row4[16] = "222"
+                row5 = [""] * 17
+                row5[14] = "333"
+                return {"values": [headers, [], row3, row4, row5]}
+
+            def fetch_sheet_metadata(self, key, params=None):
+                return {"sheets": [{"properties": {"sheetId": 9, "title": "🏠名单"}}]}
+
+            def batch_update(self, key, body=None):
+                self.requests.extend(body["requests"])
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            store.save_source(SourceConfig(
+                "t", "目标", "https://docs.google.com/spreadsheets/d/targetabcdefghijkl",
+                include_sheets=["🏠名单"], credential_path="fake.json",
+            ))
+            store.set("linked_match_target_source_id", "t")
+            store.set("linked_match_target_sheet", "🏠名单")
+            store.set("linked_data_url", "https://docs.google.com/spreadsheets/d/repositoryabcdefgh")
+            store.set("linked_data_sheet", "data")
+            store.set("linked_match_mode", "normal")
+            store.set("linked_match_date", "2026-10-14")
+            store.set("linked_match_operator", "小赵")
+            store.set("linked_match_unmatched_value", "未找到")
+            engine = DataEngine(store)
+            http = FakeHttp()
+            with patch.object(SourceReader, "_gspread_client", return_value=SimpleNamespace(http_client=http)):
+                result = engine.match_linked_data()
+        self.assertEqual(result["matched"], 2)
+        self.assertEqual(result["unmatched"], 1)
+        self.assertEqual(result["updated"], 3)
+        update = http.requests[0]["updateCells"]
+        self.assertEqual(update["range"]["startColumnIndex"], 113)
+        self.assertEqual(update["rows"][0]["values"][0]["userEnteredValue"]["stringValue"], "2026-10-14 出勤\n10/14 请假")
+        self.assertEqual(update["rows"][0]["values"][0]["note"], "O命中\n第二条")
+        self.assertEqual(update["rows"][1]["values"][0]["note"], "Q命中")
+        self.assertEqual(update["rows"][2]["values"][0]["userEnteredValue"]["stringValue"], "未找到")
+
+    def test_linked_match_makeup_uses_fixed_di_column(self):
+        self.assertEqual(DataEngine._linked_sheet_key_config("🏠人教表"), ((14, 16), "fallback"))
+        self.assertEqual(DataEngine._linked_sheet_key_config("🍓名单"), ((27, 29), "merge"))
+        self.assertEqual(DataEngine._linked_target_column([], date(2026, 10, 14), "makeup"), 112)
+        self.assertEqual(DataEngine._linked_normal_target_column([""] * 113 + ["Oct.14"], date(2026, 10, 14)), 113)
+        self.assertEqual(
+            DataEngine._linked_normal_target_column([""] * 113 + ["Oct.13", "Oct.12"], date(2026, 10, 12)),
+            114,
+        )
+        self.assertEqual(DataEngine._linked_normal_target_column([""] * 113 + ["Oct. 13\nTue"], date(2026, 10, 13)), 113)
+        self.assertEqual(DataEngine._linked_normal_target_column([""] * 113 + ["13/10"], date(2026, 10, 13)), 113)
+        self.assertEqual(DataEngine._linked_normal_target_column([""] * 113 + ["Out.13"], date(2026, 10, 13)), 113)
+        self.assertTrue(DataEngine._linked_repository_date_matches("课程 10月14日", date(2026, 10, 14)))
+        self.assertTrue(DataEngine._linked_repository_date_matches("Oct. 14 attendance", date(2026, 10, 14)))
+
+    def test_linked_match_all_dates_writes_every_date_column_and_report(self):
+        class FakeHttp:
+            def __init__(self):
+                self.batch_calls = []
+                self.value_writes = []
+
+            def values_get(self, key, range_name, params=None):
+                if range_name.endswith("!A:D"):
+                    return {"values": [
+                        ["ID", "名字", "日期", "备注"],
+                        ["111", "甲", "Oct.14 出勤", "十四日"],
+                        ["222", "乙", "Oct.13 出勤", "十三日"],
+                    ]}
+                headers = [""] * 115
+                headers[113], headers[114] = "Oct.14", "Oct.13"
+                row3 = [""] * 17
+                row3[14], row3[16] = "111", "222"
+                return {"values": [headers, [], row3]}
+
+            def fetch_sheet_metadata(self, key, params=None):
+                if key == "repositoryabcdefgh":
+                    return {"sheets": [{"properties": {"sheetId": 4, "title": "运行日志"}}]}
+                return {"sheets": [{"properties": {"sheetId": 9, "title": "🏠名单"}}]}
+
+            def batch_update(self, key, body=None):
+                self.batch_calls.append((key, body["requests"]))
+
+            def values_update(self, key, range_name, params=None, body=None):
+                self.value_writes.append((range_name, body["values"]))
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            store.save_source(SourceConfig(
+                "t", "目标", "https://docs.google.com/spreadsheets/d/targetabcdefghijkl",
+                include_sheets=["🏠名单"], credential_path="fake.json",
+            ))
+            store.set("linked_match_target_source_id", "t")
+            store.set("linked_match_target_sheet", "🏠名单")
+            store.set("linked_data_url", "https://docs.google.com/spreadsheets/d/repositoryabcdefgh")
+            store.set("linked_data_sheet", "data")
+            store.set("linked_match_mode", "normal")
+            store.set("linked_match_date", "2026-10-14")
+            store.set("linked_match_all_dates", True)
+            store.set("linked_match_operator", "小赵")
+            engine = DataEngine(store)
+            http = FakeHttp()
+            with patch.object(SourceReader, "_gspread_client", return_value=SimpleNamespace(http_client=http)):
+                result = engine.match_linked_data()
+        self.assertEqual(result["matched"], 2)
+        self.assertEqual(result["unmatched"], 0)
+        self.assertEqual(result["updated"], 2)
+        self.assertEqual(result["log_written"], 1)
+        target_requests = next(requests for key, requests in http.batch_calls if key == "targetabcdefghijkl")
+        self.assertEqual([request["updateCells"]["range"]["startColumnIndex"] for request in target_requests], [113, 114])
+        log_values = next(values for range_name, values in http.value_writes if range_name == "'运行日志'!A1")
+        self.assertEqual(log_values[1][4], "全部日期")
+        self.assertIn("Oct.14：3", log_values[1][9])
+        self.assertIn("Oct.13：3", log_values[1][9])
+        self.assertEqual(log_values[0][-1], "执行人")
+        self.assertEqual(log_values[1][-1], "小赵")
+
+    def test_linked_match_stops_when_repository_is_empty(self):
+        class EmptyHttp:
+            def values_get(self, key, range_name, params=None):
+                return {"values": []}
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            store.save_source(SourceConfig(
+                "t", "目标", "https://docs.google.com/spreadsheets/d/targetabcdefghijkl",
+                credential_path="fake.json",
+            ))
+            store.set("linked_match_target_source_id", "t")
+            store.set("linked_match_target_sheet", "🏠名单")
+            store.set("linked_data_url", "https://docs.google.com/spreadsheets/d/repositoryabcdefgh")
+            store.set("linked_match_date", "2026-10-14")
+            store.set("linked_match_operator", "小赵")
+            engine = DataEngine(store)
+            with patch.object(
+                SourceReader, "_gspread_client",
+                return_value=SimpleNamespace(http_client=EmptyHttp()),
+            ):
+                with self.assertRaisesRegex(ValueError, "没有可匹配的数据"):
+                    engine.match_linked_data()
+
     def test_clear_extract_cache_only_removes_local_dedup_history(self):
         with tempfile.TemporaryDirectory() as directory:
             store = ConfigStore(Path(directory) / "config")

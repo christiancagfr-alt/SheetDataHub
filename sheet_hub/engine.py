@@ -15,6 +15,7 @@ import openpyxl
 
 from .config_store import ConfigStore
 from .database import AggregateDatabase, SourceCache
+from .linked_operations import LinkedOperations
 from .models import (
     AnalysisResult,
     BreakdownSeries,
@@ -255,7 +256,7 @@ def _pct_change(current: float, previous: float) -> float | None:
     return (current - previous) / previous * 100.0
 
 
-class DataEngine:
+class DataEngine(LinkedOperations):
     SEMANTIC_FIELD_HINTS = {
         "日期": ("日期", "date", "datetime"),
         "号码": ("手机", "电话", "号码", "phone", "number", "tel"),
