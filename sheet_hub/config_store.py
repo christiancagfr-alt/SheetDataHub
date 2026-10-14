@@ -130,6 +130,7 @@ class ConfigStore:
             "query_refresh_cache": False,
             "query_exclude_enabled": False,
             "query_exclude_keywords": "",
+            "query_conditions": [],
             "linked_submit_source_id": "",
             "linked_submit_sheet": "",
             "linked_data_url": "",

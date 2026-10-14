@@ -110,6 +110,77 @@ def selected_table_rows_tsv(table: QTableWidget) -> str:
     )
 
 
+def spreadsheet_safe_text(value: object) -> str:
+    """Keep pasted analysis cells as plain text rather than spreadsheet formulas."""
+    text = str(value if value is not None else "").replace("\r\n", " ").replace("\r", " ").replace("\n", " ").replace("\t", " ")
+    probe = text.lstrip()
+    if probe.startswith(("=", "@")):
+        return "'" + text
+    if probe.startswith(("+", "-")):
+        try:
+            float(probe)
+        except ValueError:
+            return "'" + text
+    return text
+
+
+class QueryConditionRow(QFrame):
+    changed = Signal()
+    remove_requested = Signal(object)
+
+    def __init__(self, fields: list[str], field: str = "", value: str = "", exact: bool = True, parent=None):
+        super().__init__(parent)
+        self.setObjectName("columnMapRow")
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(8, 4, 8, 4)
+        layout.setSpacing(6)
+        label = QLabel("并且")
+        label.setFixedWidth(38)
+        self.field_box = QComboBox()
+        self.field_box.setEditable(True)
+        self.field_box.setMinimumWidth(140)
+        self.field_box.addItems(fields)
+        if field:
+            self.field_box.setCurrentText(field)
+        self.mode_box = QComboBox()
+        self.mode_box.addItem("精确等于", True)
+        self.mode_box.addItem("包含文字", False)
+        self.mode_box.setCurrentIndex(0 if exact else 1)
+        self.mode_box.setFixedWidth(92)
+        self.value_edit = QLineEdit(value)
+        self.value_edit.setPlaceholderText("条件值")
+        remove = QToolButton()
+        remove.setText("×")
+        remove.setToolTip("删除这个条件")
+        layout.addWidget(label)
+        layout.addWidget(self.field_box)
+        layout.addWidget(self.mode_box)
+        layout.addWidget(self.value_edit, 1)
+        layout.addWidget(remove)
+        self.field_box.currentTextChanged.connect(self.changed)
+        self.mode_box.currentIndexChanged.connect(self.changed)
+        self.value_edit.textChanged.connect(self.changed)
+        remove.clicked.connect(lambda: self.remove_requested.emit(self))
+
+    def set_fields(self, fields: list[str]) -> None:
+        current = self.field_box.currentText().strip()
+        self.field_box.blockSignals(True)
+        self.field_box.clear()
+        self.field_box.addItems(fields)
+        if current:
+            if current not in fields:
+                self.field_box.insertItem(0, current)
+            self.field_box.setCurrentText(current)
+        self.field_box.blockSignals(False)
+
+    def condition(self) -> dict[str, object]:
+        return {
+            "field": self.field_box.currentText().strip(),
+            "value": self.value_edit.text().strip(),
+            "exact": bool(self.mode_box.currentData()),
+        }
+
+
 def is_phone_data_table(fields: list[str] | None = None, source_name: str = "") -> bool:
     name = str(source_name or "")
     if any(hint in name for hint in PHONE_TABLE_NAME_HINTS):
@@ -744,6 +815,9 @@ class MainWindow(QMainWindow):
         self.copy_selected_query_button.setEnabled(False)
         self.copy_selected_query_button.setToolTip("选择一行或多行后复制；也可在结果表中按 Ctrl+C")
         self.copy_selected_query_button.clicked.connect(self.copy_selected_query_rows)
+        self.add_query_condition_button = QPushButton("＋ 添加条件")
+        self.add_query_condition_button.setToolTip("添加额外字段条件；查询结果必须同时满足主查询和所有附加条件。")
+        self.add_query_condition_button.clicked.connect(self.add_query_condition)
         bar.addWidget(QLabel("表格来源"))
         bar.addWidget(self.query_mode)
         bar.addWidget(self.query_table_label)
@@ -752,6 +826,7 @@ class MainWindow(QMainWindow):
         bar.addWidget(QLabel("查询字段"))
         bar.addWidget(self.query_field)
         bar.addWidget(self.query_value, 1)
+        bar.addWidget(self.add_query_condition_button)
         bar.addWidget(self.query_fuzzy)
         bar.addWidget(self.refresh_cache_button)
         bar.addWidget(button)
@@ -775,6 +850,14 @@ class MainWindow(QMainWindow):
         self.query_exclude.editingFinished.connect(self.persist_workspace_settings)
         date_bar.addWidget(self.query_exclude, 1)
         date_bar.addStretch()
+        self.query_conditions_widget = QWidget()
+        self.query_condition_layout = QVBoxLayout(self.query_conditions_widget)
+        self.query_condition_layout.setContentsMargins(0, 0, 0, 0)
+        self.query_condition_layout.setSpacing(3)
+        self.query_condition_rows: list[QueryConditionRow] = []
+        for condition in self.store.get("query_conditions", []) or []:
+            if isinstance(condition, dict):
+                self.add_query_condition(condition, persist=False)
         self.query_table = QueryResultTable()
         self.query_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.query_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -794,6 +877,7 @@ class MainWindow(QMainWindow):
         self.query_cache_status = QLabel("缓存：尚未读取")
         self.query_cache_status.setObjectName("muted")
         layout.addLayout(bar)
+        layout.addWidget(self.query_conditions_widget)
         layout.addLayout(date_bar)
         copy_bar = QHBoxLayout()
         copy_bar.addWidget(self.copy_query_button)
@@ -955,6 +1039,22 @@ class MainWindow(QMainWindow):
         self.analysis_summary = QLabel("选数据源后开始分析。勾选分类列时，曲线会按该列的不同取值分开。")
         self.analysis_summary.setObjectName("muted")
         self.analysis_summary.setWordWrap(True)
+        self.analysis_copy_daily_button = QPushButton("复制每日数据")
+        self.analysis_copy_people_button = QPushButton("复制人员明细")
+        self.analysis_copy_daily_button.setEnabled(False)
+        self.analysis_copy_people_button.setEnabled(False)
+        self.analysis_copy_daily_button.setToolTip("复制每日数据，并附上图表里勾选字段的各类别/渠道数据。")
+        self.analysis_copy_people_button.setToolTip("复制人员明细，可直接粘贴到 Google 表格或 Excel。")
+        self.analysis_copy_daily_button.clicked.connect(
+            lambda: self.copy_analysis_table(self.analysis_daily_table, "每日数据")
+        )
+        self.analysis_copy_people_button.clicked.connect(
+            lambda: self.copy_analysis_table(self.analysis_people_table, "人员明细")
+        )
+        summary_bar = QHBoxLayout()
+        summary_bar.addWidget(self.analysis_summary, 1)
+        summary_bar.addWidget(self.analysis_copy_daily_button)
+        summary_bar.addWidget(self.analysis_copy_people_button)
 
         chip_bar = QHBoxLayout()
         chip_bar.setSpacing(6)
@@ -1002,7 +1102,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.analysis_cache_status)
         layout.addLayout(compare_bar)
         layout.addLayout(stats)
-        layout.addWidget(self.analysis_summary)
+        layout.addLayout(summary_bar)
         layout.addLayout(chip_bar)
         layout.addWidget(self.analysis_chart, 2)
         layout.addWidget(tables, 3)
@@ -1618,6 +1718,10 @@ class MainWindow(QMainWindow):
             if hasattr(self, "query_exclude"):
                 self.store.set("query_exclude_keywords", self.query_exclude.text().strip())
             self.store.set("query_exclude_enabled", self.query_exclude_enabled.isChecked())
+            self.store.set(
+                "query_conditions",
+                [row.condition() for row in getattr(self, "query_condition_rows", [])],
+            )
         if hasattr(self, "linked_data_url"):
             self.store.set("linked_data_url", self.linked_data_url.text().strip())
             self.store.set("linked_data_sheet", self.linked_data_sheet.text().strip() or "data")
@@ -1817,6 +1921,37 @@ class MainWindow(QMainWindow):
         for widget in (self.query_date_field, self.query_start_date, self.query_end_date):
             widget.setEnabled(enabled)
 
+    def add_query_condition(self, condition: dict[str, object] | None = None, persist: bool = True) -> None:
+        data = condition if isinstance(condition, dict) else {}
+        fields = [self.query_field.itemText(index) for index in range(self.query_field.count())]
+        row = QueryConditionRow(
+            fields,
+            str(data.get("field", "")),
+            str(data.get("value", "")),
+            bool(data.get("exact", True)),
+            self.query_conditions_widget,
+        )
+        row.changed.connect(self.persist_workspace_settings)
+        row.remove_requested.connect(self.remove_query_condition)
+        self.query_condition_rows.append(row)
+        self.query_condition_layout.addWidget(row)
+        if persist:
+            self.persist_workspace_settings()
+
+    def remove_query_condition(self, row: QueryConditionRow) -> None:
+        if row in self.query_condition_rows:
+            self.query_condition_rows.remove(row)
+            self.query_condition_layout.removeWidget(row)
+            row.deleteLater()
+            self.persist_workspace_settings()
+
+    def current_query_conditions(self) -> list[dict[str, object]]:
+        return [
+            value
+            for value in (row.condition() for row in getattr(self, "query_condition_rows", []))
+            if str(value.get("field", "")).strip() and str(value.get("value", "")).strip()
+        ]
+
     def refresh_query_source_picker(self) -> None:
         if not hasattr(self, "query_source_pick"):
             return
@@ -1867,6 +2002,8 @@ class MainWindow(QMainWindow):
             if pick not in fields:
                 self.query_field.insertItem(0, pick)
             self.query_field.setCurrentText(pick)
+        for row in getattr(self, "query_condition_rows", []):
+            row.set_fields(fields)
         current_date_field = self.query_date_field.currentText().strip()
         saved_date_field = str(self.store.get("query_date_field", "日期") or "日期").strip()
         self.query_date_field.clear()
@@ -2119,6 +2256,8 @@ class MainWindow(QMainWindow):
         if result.headers:
             self.rebuild_analysis_header_checks(result.headers)
         self.refresh_analysis_visuals(result)
+        self.analysis_copy_daily_button.setEnabled(self.analysis_daily_table.rowCount() > 0)
+        self.analysis_copy_people_button.setEnabled(self.analysis_people_table.rowCount() > 0)
         if result.names_found:
             restoring = self._restoring_settings
             self._restoring_settings = True
@@ -2170,6 +2309,40 @@ class MainWindow(QMainWindow):
         self.update_analysis_chart(result)
         self.fill_analysis_daily_table(result)
         self.fill_analysis_people_table(result)
+
+    def copy_analysis_table(self, table: QTableWidget, label: str) -> None:
+        if table.rowCount() == 0:
+            self.statusBar().showMessage(f"沒有可複製的{label}。", 4000)
+            return
+        headers = [
+            table.horizontalHeaderItem(column).text() if table.horizontalHeaderItem(column) else ""
+            for column in range(table.columnCount())
+        ]
+        breakdown_columns: list[tuple[str, list[int]]] = []
+        result = self._analysis_result
+        if table is self.analysis_daily_table and result is not None:
+            selected = set(self.selected_analysis_headers())
+            for breakdown in result.breakdowns:
+                if breakdown.header not in selected:
+                    continue
+                for series in breakdown.series:
+                    breakdown_columns.append((f"{breakdown.header} - {series.label}", series.daily))
+            headers.extend(name for name, _values in breakdown_columns)
+        rows = [headers]
+        for row in range(table.rowCount()):
+            values = [
+                table.item(row, column).text() if table.item(row, column) else ""
+                for column in range(table.columnCount())
+            ]
+            values.extend(
+                str(series_values[row]) if row < len(series_values) else ""
+                for _name, series_values in breakdown_columns
+            )
+            rows.append(values)
+        clipboard_text = "\n".join("\t".join(spreadsheet_safe_text(cell) for cell in row) for row in rows)
+        QApplication.clipboard().setText(clipboard_text)
+        extra = f"，含 {len(breakdown_columns)} 个已勾选类别/渠道列" if breakdown_columns else ""
+        self.statusBar().showMessage(f"已复制 {table.rowCount()} 行{label}{extra}", 5000)
 
     def update_analysis_chart(self, result: AnalysisResult) -> None:
         current = result.current
@@ -2556,10 +2729,16 @@ class MainWindow(QMainWindow):
         excludes = active_query_excludes(
             self.query_exclude_enabled.isChecked(), self.query_exclude.text()
         ) if hasattr(self, "query_exclude_enabled") else []
+        for row in getattr(self, "query_condition_rows", []):
+            condition = row.condition()
+            if bool(condition.get("field")) != bool(condition.get("value")):
+                QMessageBox.warning(self, "条件不完整", "附加条件需要同时选择/填写字段和值；不使用的条件请点 × 删除。")
+                return
+        conditions = self.current_query_conditions()
         self.run_task(
             lambda: engine.query_many(
                 field, values, source == "direct", exact, source, extract_target, extract_sheet, source_id,
-                date_field, start_date, end_date, False, excludes, use_local_cache,
+                date_field, start_date, end_date, False, excludes, use_local_cache, conditions,
             ),
             lambda results: self.show_query_results(results, result_fields, field),
             "正在批量查询…",

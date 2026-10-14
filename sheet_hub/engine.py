@@ -727,10 +727,11 @@ class DataEngine(LinkedOperations):
         refresh_cache: bool = False,
         exclude_keywords: list[str] | None = None,
         use_local_cache: bool = False,
+        conditions: list[dict[str, object]] | None = None,
     ) -> list[Record]:
         results = self.query_many(
             field, [value], direct, exact, source, extract_target, extract_sheet, source_id,
-            date_field, start_date, end_date, refresh_cache, exclude_keywords, use_local_cache,
+            date_field, start_date, end_date, refresh_cache, exclude_keywords, use_local_cache, conditions,
         )
         return [record for _, record in results if record is not None]
 
@@ -750,6 +751,7 @@ class DataEngine(LinkedOperations):
         refresh_cache: bool = False,
         exclude_keywords: list[str] | None = None,
         use_local_cache: bool = False,
+        conditions: list[dict[str, object]] | None = None,
     ) -> list[tuple[str, Record | None]]:
         mode = self.query_source_mode(source, direct)
         operation = (
@@ -809,6 +811,47 @@ class DataEngine(LinkedOperations):
             before = len(records)
             records = [record for record in records if not self._is_excluded(record, exclude_needles)]
             self._log(operation, "INFO", f"关键词排除：{len(exclude_needles)} 个词，保留 {len(records)}/{before} 行")
+        clean_conditions = [
+            {
+                "field": str(item.get("field", "")).strip(),
+                "value": str(item.get("value", "")).strip(),
+                "exact": bool(item.get("exact", True)),
+            }
+            for item in (conditions or [])
+            if isinstance(item, dict)
+            and str(item.get("field", "")).strip()
+            and str(item.get("value", "")).strip()
+        ]
+        if clean_conditions:
+            before = len(records)
+
+            def satisfies(record: Record) -> bool:
+                for condition in clean_conditions:
+                    condition_field = str(condition["field"])
+                    canonical_condition = self._field_kind(condition_field)
+                    needle = self._match_value(canonical_condition, str(condition["value"]))
+                    haystacks = [
+                        self._match_value(canonical_condition, value)
+                        for value in self._query_values(record, condition_field)
+                    ]
+                    if bool(condition["exact"]):
+                        matched = needle in haystacks
+                    else:
+                        matched = any(needle in haystack for haystack in haystacks)
+                    if not matched:
+                        return False
+                return True
+
+            records = [record for record in records if satisfies(record)]
+            description = "；".join(
+                f"{item['field']} {'=' if item['exact'] else '包含'} {item['value']}"
+                for item in clean_conditions
+            )
+            self._log(
+                operation,
+                "INFO",
+                f"附加条件（全部满足）：{description}；保留 {len(records)}/{before} 行",
+            )
         canonical = self._field_kind(field)
         results: list[tuple[str, Record | None]] = []
         matched_inputs = 0

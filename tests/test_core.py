@@ -47,10 +47,12 @@ from sheet_hub.source_reader import (
 from sheet_hub.ui import (
     DEFAULT_QUERY_RESULT_FIELDS,
     QueryResultTable,
+    QueryConditionRow,
     active_query_excludes,
     is_phone_data_table,
     query_result_headers,
     selected_table_rows_tsv,
+    spreadsheet_safe_text,
 )
 from sheet_hub.version import (
     APP_VERSION,
@@ -104,6 +106,17 @@ class RuleTests(unittest.TestCase):
 
         self.assertEqual(selected_table_rows_tsv(table), "2026-10-14\t安晨\t号码表")
         table.deleteLater()
+        app.processEvents()
+
+    def test_analysis_clipboard_cells_are_safe_for_spreadsheets(self):
+        self.assertEqual(spreadsheet_safe_text("=IMPORTXML(\"x\")"), "'=IMPORTXML(\"x\")")
+        self.assertEqual(spreadsheet_safe_text("+campaign"), "'+campaign")
+
+    def test_query_condition_row_captures_field_operator_and_value(self):
+        app = QApplication.instance() or QApplication([])
+        row = QueryConditionRow(["号码", "状态"], "状态", "有效", False)
+        self.assertEqual(row.condition(), {"field": "状态", "value": "有效", "exact": False})
+        row.deleteLater()
         app.processEvents()
 
     def test_macos_entitlements_and_sign_script_exist(self):
@@ -816,6 +829,24 @@ class DatabaseTests(unittest.TestCase):
             self.assertEqual([record.sheet_name for _, record in results if record], ["A"])
             none = engine.query_many("号码", ["123"], exclude_keywords=["正常", "广告", "测试"])
             self.assertIsNone(none[0][1])
+
+    def test_query_many_requires_all_additional_conditions(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = ConfigStore(Path(directory) / "config")
+            engine = DataEngine(store)
+            engine.database.replace_all([
+                Record("s", "源", "g", "A", 2, {"号码": "123", "状态": "有效", "姓名": "安晨"}, "h1"),
+                Record("s", "源", "g", "B", 3, {"号码": "123", "状态": "无效", "姓名": "安晨"}, "h2"),
+                Record("s", "源", "g", "C", 4, {"号码": "123", "状态": "有效", "姓名": "小明"}, "h3"),
+            ])
+            results = engine.query_many(
+                "号码", ["123"],
+                conditions=[
+                    {"field": "状态", "value": "有效", "exact": True},
+                    {"field": "姓名", "value": "安", "exact": False},
+                ],
+            )
+            self.assertEqual([record.sheet_name for _, record in results if record], ["A"])
 
     def test_parse_number_strips_commas_and_percent(self):
         self.assertEqual(parse_number("1,234.50"), 1234.5)
