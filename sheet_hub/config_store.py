@@ -106,6 +106,7 @@ class ConfigStore:
             "query_field": "号码",
             "query_fields_by_mode": {},
             "query_direct_source_id": "",
+            "query_local_cache": False,
             "query_exact": True,
             "query_fuzzy": False,
             "query_date_enabled": False,

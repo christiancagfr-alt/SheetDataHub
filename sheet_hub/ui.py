@@ -506,7 +506,7 @@ class MainWindow(QMainWindow):
     def _query_page(self) -> QWidget:
         page, layout = self._page(
             "数据查询",
-            "查询走本地库。点「同步本地库」会下载表格最新数据并替换本地库。只有号码数据表才复制号码和修正格式。",
+            "查询数据源时默认在线读取；勾选“本地查询”则与数据分析共用该数据源缓存，未同步时会先同步。只有号码数据表才复制号码和修正格式。",
         )
         bar = QHBoxLayout()
         self.query_field = QComboBox()
@@ -524,6 +524,9 @@ class MainWindow(QMainWindow):
         self.query_table_label = QLabel("数据表")
         self.query_source_pick = QComboBox()
         self.query_source_pick.setMinimumWidth(140)
+        self.query_local_cache = QCheckBox("本地查询")
+        self.query_local_cache.setChecked(bool(self.store.get("query_local_cache", False)))
+        self.query_local_cache.setToolTip("勾选后与数据分析共用所选数据源的本地缓存；尚未同步时会先同步。未勾选则在线读取表格。")
         self.query_fuzzy = QCheckBox("模糊匹配")
         self.query_fuzzy.setChecked(bool(self.store.get("query_fuzzy", False)))
         self.query_fuzzy.setToolTip("勾选后可用姓名、编号或部分文字查询；查询来源时也会匹配修正格式")
@@ -545,6 +548,7 @@ class MainWindow(QMainWindow):
                 widget.setDate(saved)
         self.query_mode.currentIndexChanged.connect(self.on_query_mode_changed)
         self.query_source_pick.currentIndexChanged.connect(self.on_query_table_changed)
+        self.query_local_cache.toggled.connect(self.on_query_local_cache_changed)
         self.query_fuzzy.toggled.connect(self.persist_workspace_settings)
         self.query_date_enabled.toggled.connect(self.update_query_date_controls)
         self.query_date_enabled.toggled.connect(self.persist_workspace_settings)
@@ -565,6 +569,7 @@ class MainWindow(QMainWindow):
         bar.addWidget(self.query_mode)
         bar.addWidget(self.query_table_label)
         bar.addWidget(self.query_source_pick)
+        bar.addWidget(self.query_local_cache)
         bar.addWidget(QLabel("查询字段"))
         bar.addWidget(self.query_field)
         bar.addWidget(self.query_value, 1)
@@ -1207,6 +1212,7 @@ class MainWindow(QMainWindow):
             return
         if hasattr(self, "query_mode"):
             self.store.set("query_source", QUERY_SOURCES[self.query_mode.currentIndex()])
+            self.store.set("query_local_cache", self.query_local_cache.isChecked())
             self.store.set("query_fuzzy", self.query_fuzzy.isChecked())
             self.store.set("query_date_enabled", self.query_date_enabled.isChecked())
             self.store.set("query_date_field", self.query_date_field.currentText().strip() or "日期")
@@ -1324,6 +1330,9 @@ class MainWindow(QMainWindow):
             return
         engine = DataEngine(self.store)
         mode = self.current_query_mode()
+        if mode == "direct" and not self.query_local_cache.isChecked():
+            self.query_cache_status.setText("在线查询：直接读取所选表格；勾选“本地查询”可使用与数据分析共用的缓存")
+            return
         if mode == "aggregate":
             self.query_cache_status.setText("缓存：汇总库为本地数据，查询较快")
             return
@@ -1345,6 +1354,13 @@ class MainWindow(QMainWindow):
         self.refresh_query_fields()
         self.persist_workspace_settings()
 
+    def on_query_local_cache_changed(self) -> None:
+        if getattr(self, "_restoring_settings", False):
+            return
+        self.refresh_query_fields()
+        self.persist_workspace_settings()
+        self.update_query_cache_status()
+
     def on_query_table_changed(self) -> None:
         if getattr(self, "_restoring_settings", False):
             return
@@ -1357,6 +1373,7 @@ class MainWindow(QMainWindow):
         direct = self.current_query_mode() == "direct"
         self.query_table_label.setVisible(direct)
         self.query_source_pick.setVisible(direct)
+        self.query_local_cache.setVisible(direct)
 
     def current_extract_source_id(self) -> str:
         if not hasattr(self, "extract_source_pick"):
@@ -1419,6 +1436,7 @@ class MainWindow(QMainWindow):
         extract_target, extract_sheet = self.extract_query_target()
         fields = DataEngine(self.store).list_query_fields(
             mode, extract_target, extract_sheet, self.current_query_source_id(),
+            use_local_cache=(mode == "direct" and self.query_local_cache.isChecked()),
         )
         restoring = self._restoring_settings
         self._restoring_settings = True
@@ -2109,6 +2127,10 @@ class MainWindow(QMainWindow):
         exact = not self.query_fuzzy.isChecked()
         extract_target, extract_sheet = self.extract_query_target()
         source_id = self.current_query_source_id()
+        use_local_cache = source == "direct" and self.query_local_cache.isChecked()
+        if use_local_cache and not source_id:
+            QMessageBox.warning(self, "请选择数据源", "勾选“本地查询”时，请先选择一个数据源；该缓存与数据分析共用。")
+            return
         date_field = self.query_date_field.currentText().strip() if self.query_date_enabled.isChecked() else ""
         start_date = self.query_start_date.date().toPython() if date_field else None
         end_date = self.query_end_date.date().toPython() if date_field else None
@@ -2120,7 +2142,7 @@ class MainWindow(QMainWindow):
             self.store,
             source,
             field,
-            engine.list_query_fields(source, extract_target, extract_sheet, source_id),
+            engine.list_query_fields(source, extract_target, extract_sheet, source_id, use_local_cache),
             self.current_query_source_name(),
         )
         if hasattr(self, "query_result_summary"):
@@ -2129,10 +2151,10 @@ class MainWindow(QMainWindow):
         self.run_task(
             lambda: engine.query_many(
                 field, values, source == "direct", exact, source, extract_target, extract_sheet, source_id,
-                date_field, start_date, end_date, False, excludes,
+                date_field, start_date, end_date, False, excludes, use_local_cache,
             ),
             lambda results: self.show_query_results(results, result_fields, field),
-            "正在查询本地库…",
+            "正在批量查询…",
         )
 
     def run_refresh_cache(self) -> None:

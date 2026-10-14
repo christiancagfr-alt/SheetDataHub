@@ -670,6 +670,7 @@ class DataEngine:
         extract_target: str = "",
         extract_sheet: str = "",
         source_id: str = "",
+        use_local_cache: bool = False,
     ) -> list[str]:
         mode = self.query_source_mode(mode, False)
         if mode == "extract":
@@ -687,6 +688,10 @@ class DataEngine:
             sources = [source for source in self.store.load_sources() if source.enabled]
             if source_id.strip():
                 sources = [source for source in sources if source.id == source_id.strip()]
+            if use_local_cache and source_id.strip():
+                cached = self.source_headers(source_id)
+                if cached:
+                    return self._unique_headers(cached)
             headers: list[str] = []
             for source in sources:
                 if source.column_schema_enabled and source.column_schema:
@@ -720,10 +725,11 @@ class DataEngine:
         end_date: date | None = None,
         refresh_cache: bool = False,
         exclude_keywords: list[str] | None = None,
+        use_local_cache: bool = False,
     ) -> list[Record]:
         results = self.query_many(
             field, [value], direct, exact, source, extract_target, extract_sheet, source_id,
-            date_field, start_date, end_date, refresh_cache, exclude_keywords,
+            date_field, start_date, end_date, refresh_cache, exclude_keywords, use_local_cache,
         )
         return [record for _, record in results if record is not None]
 
@@ -742,16 +748,36 @@ class DataEngine:
         end_date: date | None = None,
         refresh_cache: bool = False,
         exclude_keywords: list[str] | None = None,
+        use_local_cache: bool = False,
     ) -> list[tuple[str, Record | None]]:
         mode = self.query_source_mode(source, direct)
-        operation = {"direct": "批量数据源查询", "extract": "批量提取表查询"}.get(mode, "批量汇总库查询")
+        operation = (
+            "批量本地数据源查询" if mode == "direct" and use_local_cache else
+            {"direct": "批量在线数据源查询", "extract": "批量提取表查询"}.get(mode, "批量汇总库查询")
+        )
         queries = list(dict.fromkeys(value.strip() for value in values if value.strip()))
         if not queries:
             raise ValueError("没有可查询的内容")
         self._log(operation, "INFO", f"开始批量查询：{len(queries)} 个值，字段“{field}”")
-        records = self._load_source_records(
-            mode, extract_target, extract_sheet, source_id, refresh_cache, operation,
-        )
+        if mode == "direct" and use_local_cache:
+            source_id = str(source_id or "").strip()
+            if not source_id:
+                raise ValueError("勾选本地查询时，请先选择一个数据源")
+            if not self.cache.has(source_id) or self.cache.row_count(source_id) == 0:
+                self._log(operation, "INFO", "本地缓存不存在，先同步所选数据源")
+                self.refresh_cache([source_id])
+            records = self._mem_load(source_id)
+            self._log(
+                operation,
+                "INFO",
+                f"从共享本地缓存读取 {len(records)} 行（上次同步：{self.cache.updated_at(source_id) or '未知'}）",
+            )
+        elif mode == "direct":
+            records = self.read_sources(operation, source_id)
+        else:
+            records = self._load_source_records(
+                mode, extract_target, extract_sheet, source_id, refresh_cache, operation,
+            )
         if date_field.strip():
             if start_date is None or end_date is None:
                 raise ValueError("日期范围不完整")

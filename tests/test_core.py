@@ -395,6 +395,42 @@ class RuleTests(unittest.TestCase):
             found = engine.query("渠道", "channel-1", source="direct", source_id="club")
             self.assertEqual(found[0].values["条目ID"], "p1")
 
+    def test_query_online_or_shared_local_source_cache(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = ConfigStore(root / "config")
+            path = root / "club.xlsx"
+
+            def save_source_row(channel: str) -> None:
+                book = openpyxl.Workbook()
+                book.active.title = "数据"
+                book.active.append(["渠道", "条目ID"])
+                book.active.append([channel, "item-1"])
+                book.save(path)
+
+            save_source_row("cached-channel")
+            store.save_source(SourceConfig("club", "数据源A", str(path)))
+            engine = DataEngine(store)
+
+            local_results = engine.query_many(
+                "渠道", ["cached-channel"], source="direct", source_id="club", use_local_cache=True,
+            )
+            self.assertIsNotNone(local_results[0][1])
+            self.assertTrue(engine.cache.has("club"))
+
+            save_source_row("online-channel")
+            online_results = engine.query_many(
+                "渠道", ["online-channel"], source="direct", source_id="club",
+            )
+            self.assertIsNotNone(online_results[0][1])
+            cached_results = engine.query_many(
+                "渠道", ["cached-channel"], source="direct", source_id="club", use_local_cache=True,
+            )
+            self.assertIsNotNone(cached_results[0][1])
+            self.assertIsNone(engine.query_many(
+                "渠道", ["online-channel"], source="direct", source_id="club", use_local_cache=True,
+            )[0][1])
+
 
 class DatabaseTests(unittest.TestCase):
     def test_clear_extract_cache_only_removes_local_dedup_history(self):
