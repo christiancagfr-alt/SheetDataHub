@@ -8,9 +8,9 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import openpyxl
-from PySide6.QtCore import QEvent, Qt
+from PySide6.QtCore import QEvent, QItemSelectionModel, Qt
 from PySide6.QtGui import QKeyEvent
-from PySide6.QtWidgets import QApplication, QAbstractItemView
+from PySide6.QtWidgets import QApplication, QAbstractItemView, QTableWidgetItem
 
 from sheet_hub.config_store import ConfigStore
 from sheet_hub.database import AggregateDatabase, SourceCache
@@ -50,6 +50,7 @@ from sheet_hub.ui import (
     active_query_excludes,
     is_phone_data_table,
     query_result_headers,
+    selected_table_rows_tsv,
 )
 from sheet_hub.version import (
     APP_VERSION,
@@ -88,6 +89,20 @@ class RuleTests(unittest.TestCase):
         table.keyPressEvent(QKeyEvent(QEvent.KeyPress, Qt.Key_C, Qt.ControlModifier))
 
         self.assertEqual(copied, [True])
+        table.deleteLater()
+        app.processEvents()
+
+    def test_copy_selected_cell_copies_entire_row_from_query_table_only(self):
+        app = QApplication.instance() or QApplication([])
+        table = QueryResultTable()
+        table.setColumnCount(3)
+        table.setRowCount(2)
+        for row, values in enumerate((("日期", "姓名", "来源"), ("2026-10-14", "安晨", "号码表"))):
+            for column, value in enumerate(values):
+                table.setItem(row, column, QTableWidgetItem(value))
+        table.selectionModel().select(table.model().index(1, 1), QItemSelectionModel.Select)
+
+        self.assertEqual(selected_table_rows_tsv(table), "2026-10-14\t安晨\t号码表")
         table.deleteLater()
         app.processEvents()
 

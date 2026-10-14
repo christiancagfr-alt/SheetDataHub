@@ -95,6 +95,21 @@ def active_query_excludes(enabled: bool, text: str) -> list[str]:
     return split_names(text) if enabled else []
 
 
+def selected_table_rows_tsv(table: QTableWidget) -> str:
+    """Copy complete visible rows for any selected cell/range in this table."""
+    selected_indexes = table.selectionModel().selectedIndexes()
+    row_indexes = sorted({index.row() for index in selected_indexes})
+    if not row_indexes:
+        row_indexes = sorted({index.row() for index in table.selectionModel().selectedRows()})
+    return "\n".join(
+        "\t".join(
+            table.item(row, column).text() if table.item(row, column) is not None else ""
+            for column in range(table.columnCount())
+        )
+        for row in row_indexes
+    )
+
+
 def is_phone_data_table(fields: list[str] | None = None, source_name: str = "") -> bool:
     name = str(source_name or "")
     if any(hint in name for hint in PHONE_TABLE_NAME_HINTS):
@@ -765,7 +780,7 @@ class MainWindow(QMainWindow):
         self.query_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.query_table.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.query_table.itemSelectionChanged.connect(
-            lambda: self.copy_selected_query_button.setEnabled(bool(self.query_table.selectionModel().selectedRows()))
+            lambda: self.copy_selected_query_button.setEnabled(bool(self.query_table.selectionModel().selectedIndexes()))
         )
         self.query_table.copy_rows_requested.connect(self.copy_selected_query_rows)
         self.query_table.verticalHeader().setVisible(False)
@@ -2668,20 +2683,11 @@ class MainWindow(QMainWindow):
         self.statusBar().showMessage(f"已复制 {max(0, len(body))} 行当前表头结果", 5000)
 
     def copy_selected_query_rows(self) -> None:
-        selected = self.query_table.selectionModel().selectedRows()
-        row_indexes = sorted({index.row() for index in selected})
-        if not row_indexes:
+        text = selected_table_rows_tsv(self.query_table)
+        if not text:
             return
-        column_count = self.query_table.columnCount()
-        lines = []
-        for row in row_indexes:
-            values = []
-            for column in range(column_count):
-                item = self.query_table.item(row, column)
-                values.append(item.text() if item is not None else "")
-            lines.append("\t".join(values))
-        QApplication.clipboard().setText("\n".join(lines))
-        self.statusBar().showMessage(f"已复制选中 {len(row_indexes)} 行", 5000)
+        QApplication.clipboard().setText(text)
+        self.statusBar().showMessage(f"已复制选中 {len(text.splitlines())} 行（完整行）", 5000)
 
     def choose_output(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "保存提取结果", self.output_path.text(), "Excel 工作簿 (*.xlsx)")
